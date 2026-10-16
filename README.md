@@ -67,6 +67,10 @@ CONSULTA (a cada pergunta)
   Resposta + evidencias
 ```
 
+Neste README, "recorte" é o conjunto de avaliações que atende aos filtros aplicados. Por
+exemplo, com o filtro de sentimento negativo, o recorte tem as 10.836 avaliações negativas da
+base. Sem filtros, o recorte é a base inteira.
+
 Organização do repositório:
 
 ```
@@ -422,6 +426,12 @@ Terceiro, a identificação de filtros implícitos. "Clientes insatisfeitos" vir
 `sentimentos=["negativo"]`; "categoria cama mesa banho" vira `categorias=[...]`, conferida contra
 as categorias que existem na base por aproximação de texto.
 
+Os filtros escolhidos na barra lateral também entram no prompt, como contexto. Assim as
+subconsultas são escritas para o recorte que vai ser buscado. Com a categoria "cama mesa banho"
+escolhida na barra lateral e a pergunta "Quais são os principais problemas?", por exemplo, as
+subconsultas passam a incluir temas próprios desses produtos, como cor diferente do anunciado e
+tecido de má qualidade, em vez de só temas genéricos.
+
 Se o LLM não estiver disponível, um conjunto de regras simples faz esse papel para o pipeline
 continuar funcionando.
 
@@ -492,9 +502,12 @@ Código: `src/voc_rag/geracao.py` e `src/app.py`
 Cada insight traz os IDs das avaliações que o sustentam, e a interface mostra o texto dessas
 avaliações logo abaixo dele.
 
-As citações também são conferidas no código. IDs que não existem no
-contexto são removidos, e um insight que fica sem nenhuma citação válida é descartado. Assim a
-rastreabilidade não fica dependendo só do que o LLM decidiu escrever.
+As citações também são conferidas no código. Formatos variados são aceitos ("[e3]", "E 3") e
+intervalos são expandidos ("E1-E4" vira E1, E2, E3 e E4). IDs que não existem no contexto são
+removidos, e um insight que fica sem nenhuma citação válida é descartado. Se nenhum insight
+sobrar, a resposta é recusada com uma mensagem fixa, em vez do resumo escrito pelo LLM, que
+afirmaria algo sem base. Assim a rastreabilidade não fica dependendo só do que o LLM decidiu
+escrever.
 
 Para cada evidência é possível ver `review_id`, `order_id`, nota, categoria, situação da entrega,
 score do reranker, posição nas buscas vetorial e BM25 e a subconsulta que a encontrou. Na aba
@@ -533,6 +546,11 @@ o assunto não exista na base; o limiar serve para descartar essas avaliações 
 mínimo de 3 evita que o sistema tire conclusões a partir de um ou dois comentários isolados. Os dois
 valores ficam em `src/voc_rag/config.py` (`LIMIAR_RERANK` e `MIN_EVIDENCIAS`) e podem ser
 ajustados pelo `.env`.
+
+Quando a recusa da verificação 3 acontece com filtros ativos, a mensagem mostra o recorte usado e
+quantas avaliações ele tinha. Se um filtro da barra lateral substituiu um valor diferente
+identificado na pergunta (por exemplo, sentimento positivo escolhido para uma pergunta sobre
+problemas), a mensagem também avisa, para o usuário perceber que o filtro pode ser a causa.
 
 A verificação 4 cobre o caso em que as avaliações passam pelo limiar, mas só tangenciam a
 pergunta. Na pergunta sobre drones, por exemplo, a busca pode trazer avaliações genéricas sobre
@@ -641,10 +659,11 @@ encontrar as evidências, e que o limiar, isoladamente, já é uma proteção co
 
 ### Fundamentação
 
-Um LLM-juiz confere se cada insight é sustentado pelas avaliações que ele cita. Dos 22 insights
-gerados nas cinco perguntas respondidas, 19 foram considerados totalmente sustentados, 3
-parcialmente sustentados (parte da afirmação não aparece nas avaliações citadas) e nenhum foi
-considerado sem sustentação. O juiz é o mesmo LLM configurado no `.env` (Gemini ou OpenAI), ou
+Um LLM-juiz confere se cada insight é sustentado pelas avaliações que ele cita. Dos 18 insights
+gerados nas cinco perguntas respondidas, 17 foram considerados totalmente sustentados, 1
+parcialmente sustentado (parte da afirmação não aparece nas avaliações citadas) e nenhum foi
+considerado sem sustentação. Em outra execução com o mesmo modelo, o resultado foi de 19
+sustentados e 3 parciais em 22 insights, o que mostra a variação entre execuções. O juiz é o mesmo LLM configurado no `.env` (Gemini ou OpenAI), ou
 seja, o modelo avalia as próprias respostas. Por isso esse número é um indicativo, não uma prova.
 
 ## 11. Exemplos de perguntas e respostas

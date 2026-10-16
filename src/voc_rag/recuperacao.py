@@ -89,33 +89,33 @@ class Recuperador:
               f"({len(self.df):,} avaliações indexadas)")
 
     # --- Estágio 1: candidatos -------------------------------------------------
-    def busca_vetorial(self, consulta: str, mascara: pd.Series, n: int) -> list:
-        """Top-n por similaridade de cosseno, restrito às avaliações permitidas pela máscara."""
+    def busca_vetorial(self, consulta: str, no_recorte: pd.Series, n: int) -> list:
+        """Top-n por similaridade de cosseno, restrito às avaliações do recorte."""
         vetor = self.embedder.encode([config.PREFIXO_CONSULTA + consulta],
                                      normalize_embeddings=True).astype(np.float32)
         params = None
-        if not mascara.all():
+        if not no_recorte.all():
             # IDSelectorBatch: o FAISS só considera os ids (posições) que passaram nos filtros
-            permitidos = np.flatnonzero(mascara.to_numpy()).astype(np.int64)
+            permitidos = np.flatnonzero(no_recorte.to_numpy()).astype(np.int64)
             params = faiss.SearchParameters(sel=faiss.IDSelectorBatch(permitidos))
         _, posicoes = self.indice.search(vetor, n, params=params)
         return [self.df["review_id"].iat[p] for p in posicoes[0] if p >= 0]
 
-    def busca_bm25(self, consulta: str, mascara: pd.Series, n: int) -> list:
+    def busca_bm25(self, consulta: str, no_recorte: pd.Series, n: int) -> list:
         tokens = tokenizar_bm25(consulta)
         if not tokens:
             return []
         scores = self.bm25.get_scores(tokens)
-        scores[~mascara.to_numpy()] = -1          # aplica os filtros de metadados
+        scores[~no_recorte.to_numpy()] = -1          # aplica os filtros de metadados
         top = np.argsort(-scores)[:n]
         return [self.df["review_id"].iat[i] for i in top if scores[i] > 0]
 
-    def candidatos_reranqueados(self, consulta: str, mascara: pd.Series, n_universo: int,
+    def candidatos_reranqueados(self, consulta: str, no_recorte: pd.Series, n_universo: int,
                                 n_rerank: int) -> list:
         """Vetorial + BM25 -> RRF -> cross-encoder. Devolve Evidencias ordenadas pelo reranker."""
-        ids_vet = self.busca_vetorial(consulta, mascara,
+        ids_vet = self.busca_vetorial(consulta, no_recorte,
                                       min(config.N_CANDIDATOS_VETORIAL, n_universo))
-        ids_bm25 = self.busca_bm25(consulta, mascara, config.N_CANDIDATOS_BM25)
+        ids_bm25 = self.busca_bm25(consulta, no_recorte, config.N_CANDIDATOS_BM25)
         fundidos = rrf([ids_vet, ids_bm25])[:n_rerank]
         if not fundidos:
             return []
@@ -141,8 +141,8 @@ class Recuperador:
         rastreio = {"filtros_metadados": filtros.descricao()}
         t0 = time.perf_counter()
 
-        mascara = filtros.para_mascara(self.df)
-        n_universo = int(mascara.sum())
+        no_recorte = filtros.no_recorte(self.df)
+        n_universo = int(no_recorte.sum())
         rastreio["avaliacoes_no_recorte"] = n_universo
         if n_universo == 0:
             rastreio["motivo"] = "Nenhuma avaliação atende aos filtros de metadados."
@@ -153,7 +153,7 @@ class Recuperador:
 
         por_consulta, detalhes = [], []
         for consulta in consultas:
-            candidatos = self.candidatos_reranqueados(consulta, mascara, n_universo, n_rerank)
+            candidatos = self.candidatos_reranqueados(consulta, no_recorte, n_universo, n_rerank)
             # Limiar de relevância + agrupamento de textos idênticos ("Muito bom" x200)
             relevantes = _agrupar_repetidos(
                 [e for e in candidatos if e.score_rerank >= config.LIMIAR_RERANK])

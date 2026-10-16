@@ -18,6 +18,9 @@ MSG_FORA_ESCOPO = ("Esta pergunta está fora do escopo da base de conhecimento, 
 MSG_SEM_EVIDENCIA = ("Não encontrei avaliações suficientemente relevantes para responder com "
                      "segurança ({n} evidência(s) acima do limiar; mínimo exigido: {minimo}). "
                      "Tente reformular a pergunta ou remover filtros.")
+MSG_RECORTE = " Recorte usado: {filtros} ({n} avaliação(ões))."
+MSG_SUBSTITUIDO = (" O filtro escolhido na barra lateral substituiu o identificado na pergunta "
+                   "({campos}); verifique se ele combina com o que foi perguntado.")
 MSG_SEM_LLM = (" Atenção: o LLM não está disponível (verifique a GOOGLE_API_KEY no .env). Sem ele, "
                "a pergunta não é reescrita e a busca fica limitada, o que pode causar esta recusa.")
 
@@ -45,8 +48,9 @@ class PipelineVoC:
         t0 = time.perf_counter()
         pergunta = pergunta.strip()
 
-        # 1) Processamento da pergunta
-        consulta, origem = processar_pergunta(pergunta, self.recuperador.categorias)
+        # 1) Processamento da pergunta (os filtros manuais entram como contexto)
+        consulta, origem = processar_pergunta(pergunta, self.recuperador.categorias,
+                                              filtros_manuais)
         res = ResultadoPipeline(pergunta=pergunta, status="respondida",
                                 consulta=consulta, origem_consulta=origem)
         if not consulta.dentro_do_escopo:
@@ -55,10 +59,10 @@ class PipelineVoC:
             return res
 
         # 2) Filtros: os inferidos pelo LLM + os escolhidos manualmente (prioridade)
-        filtros = para_filtros(consulta, self.recuperador.categorias) \
+        automaticos = para_filtros(consulta, self.recuperador.categorias) \
             if usar_filtros_automaticos else Filtros()
-        if filtros_manuais:
-            filtros = filtros.mesclar(filtros_manuais)
+        filtros = automaticos.mesclar(filtros_manuais) if filtros_manuais else automaticos
+        substituidos = _substituidos(automaticos, filtros_manuais)
         res.filtros = filtros.descricao()
 
         # 3) Recuperação híbrida
@@ -72,6 +76,12 @@ class PipelineVoC:
             res.status = "evidencia_insuficiente"
             res.mensagem = rec.rastreio.get("motivo") or MSG_SEM_EVIDENCIA.format(
                 n=len(rec.evidencias), minimo=config.MIN_EVIDENCIAS)
+            n_recorte = rec.rastreio.get("avaliacoes_no_recorte")
+            if n_recorte and not filtros.vazio():
+                res.mensagem += MSG_RECORTE.format(filtros=_formatar(res.filtros),
+                                                   n=f"{n_recorte:,}".replace(",", "."))
+            if substituidos:
+                res.mensagem += MSG_SUBSTITUIDO.format(campos="; ".join(substituidos))
             if origem == "regras":
                 res.mensagem += MSG_SEM_LLM
             return res
@@ -91,3 +101,21 @@ class PipelineVoC:
             res.mensagem = res.resposta.resumo
         res.rastreio["tempo_total_s"] = round(time.perf_counter() - t0, 2)
         return res
+
+
+def _substituidos(automaticos: Filtros, manuais: Optional[Filtros]) -> list:
+    """Campos em que o filtro manual trocou um valor diferente identificado na pergunta."""
+    if not manuais:
+        return []
+    auto, manual = automaticos.descricao(), manuais.descricao()
+    return [f"{campo}: {_valor(auto[campo])} -> {_valor(manual[campo])}"
+            for campo in manual if campo in auto and auto[campo] != manual[campo]]
+
+
+def _valor(valor) -> str:
+    return ", ".join(map(str, valor)) if isinstance(valor, list) else str(valor)
+
+
+def _formatar(filtros: dict) -> str:
+    """{'sentimentos': ['positivo'], 'estados': ['AC']} -> 'sentimentos: positivo; estados: AC'."""
+    return "; ".join(f"{campo}: {_valor(valor)}" for campo, valor in filtros.items())

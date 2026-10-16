@@ -85,22 +85,41 @@ def gerar_resposta(pergunta: str, evidencias: list, filtros: dict, stats: dict) 
     return validar_citacoes(resposta, n_evidencias=len(evidencias))
 
 
+MSG_SEM_CITACAO = ("A resposta gerada não citou nenhuma avaliação válida, então não pode ser "
+                   "apresentada como fundamentada. Tente reformular a pergunta.")
+# Intervalo de citações: "E1-E4", "E1 a E4", "E1 até E4" (já em maiúsculas)
+INTERVALO = re.compile(r"(\d+)\s*(?:-|A|ATÉ)\s*E?\s*(\d+)")
+
+
+def numeros_citados(ref: str) -> list:
+    """Extrai os números de uma citação: "[e3]" -> [3]; "E1-E4" -> [1, 2, 3, 4]; "E2, E5" -> [2, 5]."""
+    ref = ref.upper().replace("–", "-").replace("—", "-")
+    numeros = []
+    for inicio, fim in INTERVALO.findall(ref):
+        inicio, fim = int(inicio), int(fim)
+        if inicio <= fim:
+            numeros += range(inicio, fim + 1)
+    ref = INTERVALO.sub(" ", ref)   # intervalos já tratados; sobram IDs avulsos
+    return numeros + [int(n) for n in re.findall(r"\d+", ref)]
+
+
 def validar_citacoes(resposta: RespostaVoC, n_evidencias: int) -> RespostaVoC:
     """Remove citações inexistentes e descarta insights sem nenhuma evidência válida."""
-    validos = {f"E{i}" for i in range(1, n_evidencias + 1)}
     insights_ok = []
     for ins in resposta.insights:
         ids = []
         for ref in ins.evidencias:
-            ref = re.sub(r"[^\dE]", "", ref.upper())   # "[e3]" -> "E3"
-            if ref in validos and ref not in ids:
-                ids.append(ref)
+            for n in numeros_citados(ref):
+                if 1 <= n <= n_evidencias and f"E{n}" not in ids:
+                    ids.append(f"E{n}")
         if ids:
             ins.evidencias = ids
             insights_ok.append(ins)
     resposta.insights = insights_ok
-    # Sem nenhum insight rastreável, a resposta não pode ser considerada fundamentada
+    # Sem nenhum insight rastreável, a resposta não pode ser considerada fundamentada.
+    # O resumo é trocado por uma mensagem fixa: o texto do LLM afirmaria algo sem base.
     if resposta.evidencias_suficientes and not insights_ok:
         resposta.evidencias_suficientes = False
         resposta.confianca = "baixa"
+        resposta.resumo = MSG_SEM_CITACAO
     return resposta

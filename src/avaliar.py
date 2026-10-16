@@ -87,15 +87,15 @@ def precisao(textos: list, regex: str, k: int = 10) -> float:
 def avaliar_recuperacao(pipeline: PipelineVoC) -> dict:
     rec = pipeline.recuperador
     filtros = Filtros()
-    mascara = filtros.para_mascara(rec.df)
+    no_recorte = filtros.no_recorte(rec.df)
     texto = lambda ids: [rec.df["texto"].iat[rec.posicao[i]] for i in ids]
     resultados = {"vetorial": [], "bm25": [], "hibrida_rrf": [], "hibrida_rrf_rerank": []}
 
     print("\nA) RECUPERAÇÃO — precisão@10 por tema (rótulo aproximado por regex)")
     print(f"{'tema':55s} {'vet':>5s} {'bm25':>5s} {'rrf':>5s} {'rrf+rr':>6s}")
     for pergunta, regex in TEMAS:
-        ids_vet = rec.busca_vetorial(pergunta, mascara, config.N_CANDIDATOS_VETORIAL)
-        ids_bm = rec.busca_bm25(pergunta, mascara, config.N_CANDIDATOS_BM25)
+        ids_vet = rec.busca_vetorial(pergunta, no_recorte, config.N_CANDIDATOS_VETORIAL)
+        ids_bm = rec.busca_bm25(pergunta, no_recorte, config.N_CANDIDATOS_BM25)
         ids_rrf = [d for d, _ in rrf([ids_vet, ids_bm])][: config.N_PARA_RERANK]
         scores = rec.reranker.predict([(pergunta, t) for t in texto(ids_rrf)],
                                       show_progress_bar=False)
@@ -117,15 +117,15 @@ def avaliar_recuperacao(pipeline: PipelineVoC) -> dict:
 def avaliar_reescrita(pipeline: PipelineVoC) -> list:
     """Melhor score do reranker e candidatos acima do limiar para cada formulação."""
     rec = pipeline.recuperador
-    mascara = Filtros(sentimentos=["negativo"]).para_mascara(rec.df)
-    n_universo = int(mascara.sum())
+    no_recorte = Filtros(sentimentos=["negativo"]).no_recorte(rec.df)
+    n_universo = int(no_recorte.sum())
     resultados = []
 
     print(f"\nA2) REESCRITA — score do reranker por formulação "
           f"({config.N_PARA_RERANK} candidatas, recorte negativo com {n_universo:,} avaliações)")
     print(f"{'formulação':24s} {'melhor':>7s} {'acima':>6s}  consulta")
     for tipo, consulta in FORMULACOES:
-        candidatos = rec.candidatos_reranqueados(consulta, mascara, n_universo, config.N_PARA_RERANK)
+        candidatos = rec.candidatos_reranqueados(consulta, no_recorte, n_universo, config.N_PARA_RERANK)
         melhor = round(candidatos[0].score_rerank, 2) if candidatos else None
         acima = sum(e.score_rerank >= config.LIMIAR_RERANK for e in candidatos)
         resultados.append({"tipo": tipo, "consulta": consulta, "candidatos": len(candidatos),

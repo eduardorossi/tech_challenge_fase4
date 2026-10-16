@@ -1,7 +1,7 @@
 """Filtros de metadados usados na recuperação (desafio adicional).
 
-Os filtros viram uma máscara booleana do pandas sobre a base de documentos.
-A mesma máscara restringe a busca vetorial (ids permitidos no FAISS) e a
+Os filtros viram uma série booleana do pandas (True = avaliação no recorte).
+A mesma seleção restringe a busca vetorial (ids permitidos no FAISS) e a
 busca lexical (BM25), garantindo que as duas olhem para o mesmo recorte.
 """
 from dataclasses import asdict, dataclass
@@ -38,7 +38,8 @@ class Filtros:
         return Filtros(**base)
 
     # --- pandas ---------------------------------------------------------------
-    def para_mascara(self, df: pd.DataFrame) -> pd.Series:
+    def no_recorte(self, df: pd.DataFrame) -> pd.Series:
+        """Uma posição por avaliação: True se ela atende a todos os filtros."""
         m = pd.Series(True, index=df.index)
         if self.sentimentos:
             m &= df["sentimento"].isin(self.sentimentos)
