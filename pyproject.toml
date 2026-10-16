@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-customer-intelligence"
+version = "1.0.0"
+description = "Voice of Customer Intelligence: RAG sobre avaliações de clientes da Olist"
+readme = "README.md"
+requires-python = ">=3.12"
+# As dependências ficam em requirements.txt (o PyTorch é instalado à parte, pelo índice CPU)
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["voc_rag*"]
