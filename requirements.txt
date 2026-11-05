@@ -1,26 +1,13 @@
-# Voice of Customer Intelligence (RAG) - dependências
-# Instalação: pip install -r requirements.txt
-
-# PyTorch versão CPU, do índice oficial do PyTorch (o PyPI continua sendo usado para o resto).
-# Versão 2.5.1 porque as versões >= 2.6 exigem Visual C++ Redistributable recente no Windows.
-# O pip escolhe a linha certa pelo processador:
-#   Windows e Linux x64 -> variante "+cpu"
-#   macOS Apple Silicon e Linux ARM -> versão padrão (já é só CPU; não existe "+cpu")
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.1+cpu ; platform_machine == "AMD64" or platform_machine == "x86_64"
-torch==2.5.1 ; platform_machine == "arm64" or platform_machine == "aarch64"
-
-pandas>=2.2
-pyarrow>=15
+langchain>=1.0
+langchain-core>=1.0
+langchain-openai>=1.0
+langchain-google-genai>=4.0
+langchain-chroma>=1.0
+rank-bm25>=0.2.2
 numpy>=1.26
-sentence-transformers>=3.3,<5.2   # embeddings (E5) e reranker (cross-encoder)
-transformers>=4.48,<5
-faiss-cpu>=1.9                    # índice vetorial
-rank_bm25>=0.2.2                  # busca lexical
-langchain-core>=1.0               # prompts e saída estruturada
-langchain-google-genai>=4.0       # LLM Gemini
+pandas>=2.2
+pyarrow>=15.0
 python-dotenv>=1.0
-pydantic>=2.9
-streamlit>=1.40                   # interface web
-# Opcional, para usar OpenAI em vez de Gemini (LLM_PROVIDER=openai):
-# langchain-openai>=1.0
+streamlit>=1.49
+matplotlib>=3.8
+jupyter>=1.0

@@ -1,0 +1,14 @@
+[
+  {"type": "Investigação de reclamações", "question": "Quais são os principais problemas relatados pelos clientes em suas avaliações?", "expected_status": "respondida"},
+  {"type": "Tema específico", "question": "O que os clientes relatam sobre problemas relacionados à entrega?", "expected_status": "respondida", "expected_filters": []},
+  {"type": "Experiências positivas", "question": "Quais aspectos da experiência de compra são mais elogiados pelos clientes?", "expected_status": "respondida", "expected_filters": [["score", ">=", 4]]},
+  {"type": "Insatisfação", "question": "Quais padrões podem ser identificados nas avaliações de clientes insatisfeitos?", "expected_status": "respondida", "expected_filters": [["score", "<=", 2]]},
+  {"type": "Exploração baseada em evidências", "question": "Quais avaliações sustentam a conclusão de que existem problemas recorrentes relacionados ao prazo de entrega?", "expected_status": "respondida"},
+  {"type": "Metadados: nota baixa", "question": "Quais são os principais problemas relatados nas avaliações com nota baixa?", "expected_status": "respondida", "expected_filters": [["score", "<=", 2]]},
+  {"type": "Metadados: categoria", "question": "O que os clientes mais elogiam em produtos de cama, mesa e banho?", "expected_status": "respondida", "expected_filters": [["score", ">=", 4], ["category", "==", "cama_mesa_banho"]]},
+  {"type": "Metadados: entrega atrasada", "question": "Quais temas aparecem nas avaliações de pedidos entregues com atraso?", "expected_status": "respondida", "expected_filters": [["delivery_status", "==", "atrasado"]]},
+  {"type": "Metadados: período", "question": "Do que os clientes reclamaram nas compras de novembro de 2017?", "expected_status": "respondida", "expected_filters": [["purchase_month_num", ">=", 201711], ["purchase_month_num", "<=", 201711]]},
+  {"type": "Metadados: estado", "question": "O que os clientes de São Paulo reclamam sobre a entrega?", "expected_status": "respondida", "expected_filters": [["state", "in", ["SP"]]]},
+  {"type": "Fora do escopo", "question": "Qual é a previsão do tempo para São Paulo amanhã?", "expected_status": "fora_do_escopo"},
+  {"type": "Sem evidências suficientes", "question": "O que os clientes dizem sobre o programa de cashback em criptomoedas da loja?", "expected_status": "evidencia_insuficiente"}
+]
