@@ -292,10 +292,28 @@ Você precisa de Python 3.11 ou superior e da chave de API da OpenAI ou do Googl
 git clone <url-do-repositorio>
 cd voc-rag-olist
 python -m venv .venv
-source .venv/bin/activate        # no Windows use .venv\Scripts\activate
+source .venv/bin/activate        # Linux/macOS; no Windows veja a tabela abaixo
 pip install -r requirements.txt
 cp .env.example .env             # preencha a chave do provedor
 ```
+
+O comando de ativação do ambiente virtual depende do terminal:
+
+| Terminal | Comando |
+|---|---|
+| Linux/macOS (bash/zsh) | `source .venv/bin/activate` |
+| Windows PowerShell | `.\.venv\Scripts\Activate.ps1` |
+| Windows CMD | `.venv\Scripts\activate.bat` |
+| Windows Git Bash | `source .venv/Scripts/activate` |
+
+O `source` só existe no Bash. No PowerShell, ele gera o erro "O termo 'source' não é reconhecido como nome de cmdlet". Se o PowerShell bloquear o script com o aviso "a execução de scripts foi desabilitada neste sistema", libere a execução para o seu usuário e ative de novo:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
+```
+
+O ambiente está ativo quando `(.venv)` aparece no início do prompt.
 
 Baixe a base em https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce e coloque os arquivos em `data/raw/`. O pipeline usa estes cinco:
 
