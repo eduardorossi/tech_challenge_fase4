@@ -13,6 +13,8 @@ st.set_page_config(page_title="Voz do Cliente | Olist", page_icon="◉", layout=
 
 st.html("""
     <style>
+        [data-testid="stChatMessage"]:has([aria-label="Chat message from user"])
+        > [data-testid="stChatMessageAvatarImage"],
         [data-testid="stChatMessage"] > img[alt="user avatar"] {
             background-color: #ED145B;
             object-fit: contain;
@@ -31,6 +33,8 @@ st.html("""
             overflow-wrap: anywhere;
         }
 
+        [data-testid="stChatMessage"]:has([aria-label="Chat message from assistant"])
+        > [data-testid="stChatMessageAvatarImage"],
         [data-testid="stChatMessage"] > img[alt="assistant avatar"] {
             width: 3.5rem;
             object-fit: contain;
