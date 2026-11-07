@@ -115,7 +115,6 @@ class EvaluationRunner:
     def retriever(self, settings: Settings, unfiltered: bool = False) -> ReviewRetriever:
         reranker = self.reranker if settings.use_rerank else None
         if reranker is not None and unfiltered:
-            # Ranking puro: o corte do reranker sai para medir só a ordenação.
             reranker = copy(reranker)
             reranker.min_score = float("-inf")
         return ReviewRetriever(self.store, settings, self.lexical if settings.use_bm25 else None, reranker)

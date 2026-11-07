@@ -121,7 +121,6 @@ class VoCPipeline:
             return base
 
         if not self.generator.available:
-            # Sem LLM, a recuperação ainda entrega as evidências do recorte.
             trace["stopped_at"] = "no_llm"
             return replace(base, status=Status.ERROR, summary=GENERATION_UNAVAILABLE_MESSAGE)
         step = time.perf_counter()

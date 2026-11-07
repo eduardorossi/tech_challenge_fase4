@@ -36,7 +36,6 @@ class E5Embeddings(Embeddings):
             encoder = SentenceTransformer(model)
         self.model = encoder
         self.batch_size = batch_size
-        # Os prefixos só valem para a família E5; outro modelo local recebe o texto puro.
         self.use_prefixes = "e5" in model.lower()
 
     def _encode(self, texts: list[str], prefix: str, show_progress: bool = False) -> list[list[float]]:
