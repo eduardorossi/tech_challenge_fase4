@@ -1,7 +1,28 @@
+# Segredos e configuração local
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Ambiente e cache do Python
 .venv/
 __pycache__/
-*.pyc
-artefatos/
-data/
-*.egg-info/
+*.py[cod]
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Dados reconstruíveis (CSVs do Kaggle, parquets, índice e saída da avaliação)
+data/raw/*.csv
+data/raw/*.zip
+data/processed/
+data/chroma/
+data/faiss/
+data/eval/
+
+# Editor e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log

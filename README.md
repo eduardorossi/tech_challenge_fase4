@@ -1,139 +1,362 @@
-# Voice of Customer Intelligence: RAG sobre avaliações da Olist
+# Voz do Cliente Olist
 
-Tech Challenge da Fase 4 (Deep Learning & NLP), FIAP Pós-Tech AI Scientist.
+Solução de Voice of Customer com RAG para o Tech Challenge da Fase 4. Você pergunta em linguagem natural sobre as avaliações da base Brazilian E-Commerce Public Dataset by Olist e recebe um resumo com as avaliações que o sustentam. Se a pergunta foge do tema ou a base não tem avaliações sobre o assunto, o sistema responde que não consegue afirmar nada.
 
-Este projeto usa Retrieval-Augmented Generation (RAG) para transformar cerca de 42 mil
-comentários de clientes do Brazilian E-Commerce Public Dataset by Olist em uma base de
-conhecimento que pode ser consultada em linguagem natural. O gestor pergunta, por exemplo,
-"Quais são os principais problemas relatados?" e recebe uma resposta montada a partir de
-avaliações reais, com a indicação de quais avaliações sustentam cada conclusão. Se a base não
-tiver informação suficiente, o sistema diz isso em vez de inventar uma resposta.
+## Problema de negócio
 
-## Sumário
-1. [Problema de negócio](#1-problema-de-negócio)
-2. [Arquitetura](#2-arquitetura)
-3. [Tecnologias](#3-tecnologias)
-4. [Instalação e execução](#4-instalação-e-execução)
-5. [Construção da base de conhecimento](#5-construção-da-base-de-conhecimento)
-6. [Pipeline RAG](#6-pipeline-rag)
-7. [Respostas fundamentadas e rastreabilidade](#7-respostas-fundamentadas-e-rastreabilidade)
-8. [Perguntas sem evidências suficientes](#8-perguntas-sem-evidências-suficientes)
-9. [Metadados (desafio adicional)](#9-metadados-desafio-adicional)
-10. [Avaliação](#10-avaliação)
-11. [Exemplos de perguntas e respostas](#11-exemplos-de-perguntas-e-respostas)
-12. [Decisões técnicas e desafios](#12-decisões-técnicas-e-desafios)
-13. [Limitações e próximos passos](#13-limitações-e-próximos-passos)
+A Olist reúne 99.224 avaliações de pedidos feitos entre 2016 e 2018. A nota diz se o cliente gostou da compra. O motivo fica no comentário, e só 41% dos clientes escreveram algum. Um gestor não lê 40 mil comentários. Com este projeto, ele pergunta "o que os clientes relatam sobre atrasos?" e lê um resumo que aponta as avaliações usadas.
 
-## 1. Problema de negócio
+## Arquitetura
 
-A empresa acumula milhares de avaliações, mas os gestores não conseguem extrair delas, com
-rapidez, quais são os problemas, os elogios e os padrões mais comuns. Ler os comentários um a um
-não escala. Perguntar direto a um LLM também não resolve, porque ele responderia com
-conhecimento genérico sobre e-commerce, e não com o que estes clientes escreveram.
-
-Com RAG, o sistema primeiro busca as avaliações relacionadas à pergunta e só então pede ao
-modelo que responda, usando apenas essas avaliações como base.
-
-## 2. Arquitetura
-
-A solução tem duas partes. A preparação roda uma vez e gera os arquivos da base; a consulta
-roda a cada pergunta.
-
-```
-PREPARACAO (uma vez)
-
-  CSVs Olist -> preparacao.py -> documentos.parquet -> indexacao.py -> indice_faiss.bin
-                (selecao, limpeza,  (1 avaliacao =      (embeddings E5)   (FAISS)
-                 metadados)          1 documento)
-
-CONSULTA (a cada pergunta)
-
-  Pergunta
-    |
-  [1] LLM processa a pergunta: escopo, tipo, subconsultas, filtros
-    |      fora do escopo? -> recusa
-  [2] filtros de metadados definem o recorte da base
-    |
-  [3] para cada subconsulta: busca vetorial + BM25 -> RRF -> reranker -> limiar
-    |
-  [4] selecao das evidencias (cota por subtema + MMR)
-    |      menos de 3 evidencias? -> recusa
-  [5] montagem do contexto com as evidencias numeradas [E1], [E2]...
-    |
-  [6] LLM gera a resposta citando as evidencias
-    |
-  [7] validacao das citacoes no codigo
-    |      nenhum insight com citacao valida? -> recusa
-  Resposta + evidencias
+```mermaid
+flowchart TD
+    subgraph offline["Preparação, roda uma vez"]
+        A[CSVs da Olist] --> B[ReviewDataPreparer]
+        B --> C[reviews_analytics.parquet]
+        B --> D[reviews_documents.parquet]
+        D --> E[ReviewIndexer]
+        E --> F[(FAISS exato com embeddings E5 locais)]
+    end
+    subgraph online["Consulta"]
+        Q[Pergunta e recorte opcional] --> QA[QueryAnalyzer]
+        QA -->|fora do escopo| X1[Recusa]
+        QA -.->|LLM indisponível| RU[Regras de fallback]
+        RU -.-> RT
+        QA -->|frases de busca e filtros| RT[ReviewRetriever]
+        F --> RT
+        D --> BM[LexicalIndex BM25]
+        BM --> RT
+        RT <-->|logit de relevância| RR[CrossEncoderReranker]
+        QA -->|filtros| ST[ReviewStats]
+        C --> ST
+        RT -->|menos de 3 evidências| X2[Evidência insuficiente]
+        RT --> G[AnswerGenerator]
+        ST --> G
+        G -->|modelo sinaliza falta de evidência| X2
+        G --> R[Resposta com insights e IDs das avaliações]
+    end
 ```
 
-Neste README, "recorte" é o conjunto de avaliações que atende aos filtros aplicados. Por
-exemplo, com o filtro de sentimento negativo, o recorte tem as 10.836 avaliações negativas da
-base. Sem filtros, o recorte é a base inteira.
+| Componente | Arquivo | Responsabilidade |
+|---|---|---|
+| `Settings` | `voc_rag/config.py` | Guarda caminhos, provedores, modelos e parâmetros de busca |
+| Provedores | `voc_rag/llm.py` | Cria os modelos de chat (OpenAI ou Gemini) e os embeddings: E5 local (`E5Embeddings`, com os prefixos `query:`/`passage:`), OpenAI ou Gemini |
+| `ReviewDataPreparer` | `voc_rag/preparation.py` | Lê os CSVs, limpa os textos, junta metadados e grava os parquets |
+| `ReviewIndexer` | `voc_rag/indexing.py` | Gera os embeddings e cria o índice do modelo no FAISS (padrão) ou no Chroma |
+| `FaissReviewStore` | `voc_rag/vector_store.py` | Busca exata no FAISS com pré-filtro de metadados (`IDSelectorBatch`) e devolve os vetores do próprio índice (`reconstruct`) |
+| `ChromaReviewStore` | `voc_rag/vector_store.py` | Mesma interface sobre o Chroma, para quem prefere embeddings por API |
+| `QueryAnalyzer` | `voc_rag/query_analyzer.py` | Checa o escopo, classifica a pergunta, escreve as frases de busca e extrai filtros; cai nas regras (`rules_analysis`) quando o LLM falha e aproxima a categoria por `difflib` (`CategoryMatcher`) |
+| `LexicalIndex` | `voc_rag/lexical.py` | Busca por palavras com BM25, respeitando os filtros |
+| `CrossEncoderReranker` | `voc_rag/reranker.py` | Padrão: cross-encoder multilíngue local que dá um logit de relevância a cada par (frase de busca, avaliação) |
+| `LLMReranker` | `voc_rag/reranker.py` | Alternativa (`RERANKER=llm`): o LLM dá a cada candidato uma nota de relevância de 0 a 3 |
+| `ReviewRetriever` | `voc_rag/retriever.py` | Junta busca densa e BM25, aplica corte e rerank, divide as vagas entre as frases e agrupa repetidos |
+| `ReviewStats` | `voc_rag/stats.py` | Calcula os números do recorte sobre a base completa |
+| `AnswerGenerator` | `voc_rag/generator.py` | Monta o contexto, gera a resposta estruturada e valida as citações |
+| `VoCPipeline` | `voc_rag/pipeline.py` | Encadeia as etapas, aplica o recorte manual, devolve as recusas e registra o rastreio |
+| Avaliação | `voc_rag/evaluation.py` | Mede recuperação, recusas, filtros, fundamentação, custo e tempo |
+| Esquemas | `voc_rag/schemas.py` | Define os modelos Pydantic da saída do LLM e os objetos de resultado |
+| Prompts | `voc_rag/prompts.py` | Guarda as instruções dos modelos e as mensagens de recusa |
+| Interface | `app.py` | Chat em Streamlit com evidências, recorte, panorama e rastreio |
+| Linha de comando | `voc_rag/cli.py` | Comandos `prepare`, `index`, `ask`, `examples` e `evaluate` |
 
-Organização do repositório:
+## Tecnologias
 
+- Python 3.11 ou superior
+- LangChain (`langchain`, `langchain-core`, `langchain-openai`, `langchain-google-genai` e `langchain-chroma`), com `init_chat_model` para trocar de provedor pelo `.env`
+- OpenAI ou Google Gemini por API para análise da pergunta, geração e juiz da avaliação (e, opcionalmente, embeddings e rerank)
+- `sentence-transformers` com PyTorch CPU para os modelos locais: embeddings `intfloat/multilingual-e5-small` e reranker `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`. Não precisam de GPU
+- FAISS (`faiss-cpu`) como banco vetorial padrão; Chroma como alternativa (`VECTOR_STORE=chroma`)
+- `rank-bm25` para a busca lexical, em memória
+- pandas e pyarrow para preparação e estatísticas
+- Streamlit para a interface
+- Jupyter e matplotlib para os notebooks
+
+## Preparação da base
+
+O comando `python -m voc_rag.cli prepare` gerou os números abaixo a partir dos arquivos do Kaggle.
+
+| Métrica | Valor |
+|---|---|
+| Avaliações no arquivo | 99.224 |
+| `review_id` repetidos, com a mesma avaliação ligada a mais de um pedido | 814 |
+| Avaliações sem título | 88,3% |
+| Avaliações sem comentário | 58,7% |
+| Tamanho mediano do comentário | 53 caracteres, com máximo de 208 |
+| Avaliações com texto depois da limpeza | 42.370 |
+| Documentos indexados | 39.192 |
+
+### Seleção dos dados
+
+O projeto usa cinco arquivos. `order_reviews` traz nota, título e comentário. `orders` traz as datas de compra, entrega e prazo estimado. `order_items` e `products` informam a categoria do produto, e `customers` informa o estado do cliente.
+
+Deixamos de fora pagamentos, vendedores e a tradução de categorias. A forma de pagamento e o vendedor não ajudam a encontrar nem a filtrar comentários, e as perguntas chegam em português, a mesma língua das categorias originais.
+
+### Limpeza e preparação dos textos
+
+Os modelos de embeddings foram treinados com texto natural. Se a limpeza apagar o "não" de "não recebi", a frase inverte o sentido. Por isso a limpeza mexe pouco no texto.
+
+A função `clean_text` faz estas trocas:
+
+- normaliza o Unicode para NFC, e cada letra acentuada passa a ter uma codificação só;
+- troca quebras de linha e tabulações por espaço, um problema presente em 3.852 comentários;
+- substitui e-mails, URLs, CPFs e telefones por `[email]`, `[url]`, `[cpf]` e `[telefone]`, para que dados pessoais não cheguem às APIs (LGPD);
+- reduz pontuação repetida, como "!!!!!", a um caractere.
+
+A função `compose_text` junta título e comentário e descarta o título quando ele já aparece no comentário. A limpeza mantém maiúsculas, stopwords, acentos e a forma original das palavras. A busca BM25 usa uma tokenização própria, descrita em [Pipeline RAG](#pipeline-rag).
+
+### Tratamento de valores ausentes
+
+| Situação | Tratamento | Motivo |
+|---|---|---|
+| Sem título e sem comentário | A avaliação fica na base analítica e sai do índice | A nota continua valendo nas estatísticas |
+| Só título, em 1.729 avaliações | Vira documento se passar no filtro de tamanho | Títulos como "Não recebi o produto" têm conteúdo |
+| Sem data de entrega | `delivery_status = nao_entregue` | O pedido que não chegou explica a insatisfação |
+| Sem categoria, em 610 produtos e 759 avaliações de pedidos sem item | `category = sem_categoria` | A avaliação continua na base |
+| Dias de atraso sem data de entrega | `delay_days` nulo (`Int64`) | Um valor sentinela, como -999, distorceria médias e filtros |
+| `review_id` repetido | O preparador mantém uma linha | O texto e a nota se repetem iguais |
+
+### Organização dos documentos
+
+Cada avaliação vira um documento. O comentário mais longo tem 208 caracteres, então não precisamos dividir textos em pedaços. O ID do documento é o `review_id`, e com ele você rastreia qualquer citação até a linha do CSV.
+
+O índice recebe textos com duas palavras ou mais e ao menos uma letra. A regra tira do índice os elogios de uma palavra, como "bom" e "ótimo", que somam 2.664 comentários na base bruta. Também tira 186 textos sem letras, como "." e "10". Textos curtos com conteúdo, como "Não recebi", entram.
+
+Cada documento carrega os metadados `review_id`, `score`, `category`, `delivery_status`, `delay_days`, `purchase_month`, `purchase_month_num` e `state`.
+
+A base analítica `reviews_analytics.parquet` guarda as 98.410 avaliações únicas, com ou sem texto. A base de documentos `reviews_documents.parquet` guarda as 39.192 indexáveis.
+
+### Embeddings e indexação
+
+O modelo padrão é o `intfloat/multilingual-e5-small`, que roda local em CPU. Ele foi treinado para busca assimétrica (pergunta curta contra passagem) e exige prefixos: a frase de busca entra como `query: ...` e cada avaliação como `passage: ...`. A classe `E5Embeddings` aplica os prefixos e normaliza os vetores. Indexar não custa nada, funciona offline e é reproduzível: o mesmo texto sempre gera o mesmo vetor. Com `EMBEDDING_PROVIDER=openai` ou `google`, o projeto usa o `text-embedding-3-small` ou o `gemini-embedding-2-preview` por API.
+
+O banco vetorial padrão é o FAISS, com um índice exato (`IndexFlatIP` sobre vetores normalizados, ou seja, cosseno). Com 39 mil vetores de 384 dimensões, a busca exata leva poucos milissegundos e dispensa índice aproximado. O filtro de metadados vira uma máscara do pandas, e o `IDSelectorBatch` faz o FAISS comparar a consulta só com as avaliações do recorte: o filtro entra **antes** da busca, então um recorte pequeno, como "Roraima com nota até 2", recebe as mesmas 40 candidatas que a base inteira receberia. Filtrar depois de uma busca global perderia quase todas. O índice e a lista de IDs ficam em `data/faiss/`, um arquivo por modelo de embeddings; ao carregar, o código confere se a lista de IDs é a mesma do parquet de documentos.
+
+Os vetores dos candidatos saem do próprio índice (`reconstruct`), e o MMR usa esses vetores sem recalcular embeddings.
+
+Com `VECTOR_STORE=chroma`, o projeto usa o Chroma local em `data/chroma`, com uma coleção por modelo e distância de cosseno explícita. O BM25 roda em memória, sobre o parquet de documentos, nos dois casos.
+
+## Pipeline RAG
+
+1. **Transformação da pergunta.** O `QueryAnalyzer` faz uma chamada ao LLM com saída estruturada no esquema `QueryAnalysis`. O modelo informa se a pergunta está no escopo, se ela pede um panorama ("quais os principais problemas?") ou trata de um assunto específico, escreve as frases de busca e preenche os filtros. As frases são escritas como um cliente escreveria na avaliação: de 4 a 6 em perguntas de panorama, uma por subtema provável, e 1 ou 2 em perguntas específicas. Uma pergunta abstrata sobre "problemas" fica longe, no espaço vetorial, de uma avaliação que diz "o produto não chegou"; as frases concretas encurtam essa distância. O código aproxima a categoria escrita pelo modelo da grafia da base com `difflib` ("cama, mesa e banho" vira `cama_mesa_banho`) e descarta o que não se parece com nenhuma categoria. Se o LLM falhar (sem chave, sem cota, timeout), a análise cai em regras determinísticas: palavras como "insatisfeitos" e "elogios" definem a faixa de nota e os subtemas ("reclamações" muda só os subtemas), "principais" e "padrões" marcam a pergunta como panorama, e mês, ano, estado, categoria e situação de entrega são lidos por expressões regulares. A resposta avisa que o escopo não foi verificado.
+2. **Busca híbrida.** Para cada frase, o `ReviewRetriever` pede ao FAISS os 40 documentos mais próximos e ao BM25 os 40 de maior pontuação, os dois com os mesmos filtros. O BM25 encontra termos exatos, como "correios" ou "nota fiscal". A tokenização do BM25 tira acentos e stopwords e corta as palavras em 5 letras, mas mantém o "não". As duas listas são fundidas por Reciprocal Rank Fusion (RRF, k=60), que combina posições e dispensa normalizar os scores.
+3. **Corte de similaridade.** O retriever lê os vetores dos candidatos no índice e calcula o cosseno com a frase de busca, inclusive para os que vieram só do BM25. O corte depende do modelo: o E5 concentra as similaridades numa faixa alta, e o padrão é 0,80; com os modelos por API, 0,40.
+4. **Rerank.** Até 30 candidatos por frase vão ao cross-encoder `mmarco-mMiniLMv2-L12-H384-v1`, treinado no mMARCO (que inclui português). Ele lê a frase de busca e a avaliação juntas e devolve um logit de relevância; só ficam as avaliações com logit acima de `MIN_RERANK_SCORE` (−1 por padrão, calibrado no split `dev`: com 0, recortes estreitos como as 35 avaliações do Acre eram recusados). Todos os pares de todas as frases vão num único lote. O rerank é determinístico, não custa nada por consulta e o score contínuo permite calibrar o corte. Com `RERANKER=llm`, o LLM lê a pergunta original, o filtro, a frase de busca e cada avaliação e dá uma nota de 0 a 3; só ficam as notas 2 e 3.
+5. **Seleção.** As vagas do contexto (12 em perguntas específicas, 20 em panorama) são divididas igualmente entre as frases com resultado, para que todos os subtemas apareçam; com 6 frases, a divisão fica em 4, 4, 3, 3, 3 e 3. Dentro da vaga de cada frase, o MMR (Maximal Marginal Relevance, λ=0,7) escolhe avaliações relevantes e diferentes entre si, o que evita quatro versões de "chegou atrasado". Várias avaliações "Não recebi o produto" viram uma evidência com contador de repetições.
+6. **Panorama.** O `ReviewStats` aplica os mesmos filtros na base analítica completa e calcula total de avaliações, percentual com comentário, distribuição de notas, situação de entrega e, sem filtro de estado, os estados com mais avaliações.
+7. **Construção do contexto.** Cada evidência entra no prompt com ID `R1`, `R2` e assim por diante, seguida dos metadados do pedido (nota, categoria, entrega, mês e estado), da frase de busca que a encontrou e do texto do cliente, em blocos separados.
+8. **Geração.** O `AnswerGenerator` pede ao LLM uma saída `GeneratedAnswer` com resumo, insights, IDs que sustentam cada insight e limitações. Em seguida, o código valida as citações e descarta insights sem citação válida.
+
+Cada componente pode ser desligado no `.env` (`USE_MULTI_QUERY`, `USE_BM25` e `USE_RERANK`). A avaliação compara as combinações.
+
+## Respostas fundamentadas em evidências
+
+Cada insight exibido cita pelo menos uma avaliação, e o `AnswerGenerator` confere as citações depois da geração. A validação aceita variações como `[R1]` e `r 1` e intervalos como `R1-R3`, remove IDs que não existem no contexto e descarta o insight que fica sem citação. Se nenhum insight sobrar, a resposta vira "evidência insuficiente".
+
+O prompt instrui o modelo a não estimar frequências a partir da amostra recuperada nem ordenar temas por recorrência, porque as vagas são divididas por subtema: cada tema aparece com o mesmo número de evidências, tenha ele dez ou mil avaliações na base. Os números da resposta vêm do panorama, que o pandas calcula sobre a base inteira.
+
+O contexto identifica separadamente o texto do cliente e os metadados do pedido. O gerador deve atribuir relatos apenas ao texto: um pedido classificado como atrasado pode ter um comentário que só elogia o produto. Quando usar a situação de entrega calculada, a resposta deve indicar que essa informação vem dos metadados. A avaliação mede quantos insights violam essa regra.
+
+Na interface, a tela inicial apresenta indicadores da base e três temas para começar a exploração. A barra lateral reúne as perguntas de exemplo, o recorte da análise e a ação de iniciar uma nova conversa. Cada pergunta é analisada de forma independente.
+
+Enquanto a análise roda, de 10 a 20 segundos, um painel abaixo da pergunta mostra a etapa atual (entender a pergunta, buscar, avaliar a relevância e escrever a análise) e o que já foi decidido: o tipo da pergunta, as frases de busca, o recorte aplicado e quantas avaliações foram encontradas e selecionadas. A barra lateral fica travada e avisa que o recorte em uso continua aplicado.
+
+Cada resposta destaca a síntese e os principais achados com os IDs citados. As abas separam as avaliações (com similaridade, nota do rerank e a frase de busca que encontrou cada uma), o panorama do recorte e os detalhes da busca: filtros, frases, funil de cada frase, tempo e tokens. A análise pode ser baixada em Markdown, e falhas de consulta permitem tentar novamente sem perder o histórico. O tema visual fica em `.streamlit/config.toml`.
+
+## Perguntas sem evidências suficientes
+
+O pipeline tem quatro pontos de parada, do mais barato para o mais caro. O campo `stopped_at` do rastreio registra qual deles recusou.
+
+| Barreira | Quando recusa | `stopped_at` |
+|---|---|---|
+| Escopo | O `QueryAnalyzer` conclui que a pergunta não trata da experiência de compra | `scope` |
+| Recorte vazio | Nenhuma avaliação da base atende aos filtros, como um ano fora do período de 2016 a 2018 | `empty_filter` |
+| Similaridade | Nenhum candidato passa do corte de cosseno | `similarity` |
+| Rerank | Menos de 3 avaliações recebem nota 2 ou 3 | `rerank` |
+| Gerador | O LLM marca `sufficient_evidence = false`, ou a validação elimina todos os insights | `generator` |
+
+Com o recorte vazio, a resposta informa o filtro aplicado e o período coberto pela base, por exemplo: "Nenhuma avaliação da base atende ao recorte da pergunta (Entrega == Não entregue; Mês da compra >= 2025-01; Mês da compra <= 2025-12). A base cobre compras de 2016-09 a 2018-10." O pipeline não troca o período por conta própria, para não responder a uma pergunta diferente da feita. As barreiras de recorte vazio, similaridade e rerank recusam sem chamar o gerador, e a de recorte vazio também dispensa a busca. Se a chamada ao LLM falhar, o pipeline devolve o status `erro`, mantém as evidências já recuperadas e a interface oferece "Tentar novamente".
+
+Os prompts tratam a pergunta e o texto das avaliações como dados. Pedidos para inventar avaliações, ignorar regras ou assumir outro papel não são obedecidos, e a avaliação inclui um caso desses.
+
+O corte de cosseno funciona como pré-filtro barato, não como barreira. Com o E5, frases sem base na Olist (drone, criptomoedas, Lua, milhas, videochamada, cashback, capital da França, receita de bolo) tiveram similaridade máxima entre 0,83 e 0,90, na mesma faixa das frases com resposta (0,89 a 0,96). Quem separa os grupos é o cross-encoder: entre os 40 vizinhos de cada frase sem base, no máximo 1 passou do logit 0, o que fica abaixo do mínimo de 3 evidências; frases com resposta tiveram de 10 a 34 aprovadas. Na execução anterior, com `text-embedding-3-small` e rerank por LLM, o padrão foi o mesmo: similaridade entre 0,58 e 0,73 nas perguntas sem base e nota máxima 1 no rerank, contra 3 nas que têm resposta. O split `dev` da avaliação registra a maior similaridade e a maior nota do rerank de cada pergunta; use-o para recalibrar quando trocar o modelo de embeddings.
+
+## Metadados e exploração contextual
+
+O FAISS (pelo `IDSelectorBatch`) e o BM25 aplicam os filtros antes de ordenar. Numa busca por "problemas nas avaliações com nota baixa" sem filtro, elogios com as mesmas palavras aparecem entre os resultados. Com `score <= 2`, a busca considera só avaliações negativas.
+
+Os filtros vêm de duas fontes. O analisador extrai os da pergunta: nota, situação de entrega, categoria, período e estado do cliente. A barra lateral permite escolher um recorte manual, que tem prioridade. Quando o recorte manual troca um filtro identificado na pergunta, a resposta traz um aviso, porque o filtro pode ser a causa de uma resposta inesperada. A chave "Usar filtros de metadados" desliga os dois de uma vez.
+
+Os filtros devem vir da pergunta original, não dos termos acrescentados na reescrita da busca. Perguntar por reclamações sobre entrega ou relatos de atraso mantém a situação de entrega sem filtro. Pedir "somente pedidos entregues com atraso" aplica `delivery_status = atrasado`. Isso preserva a diferença entre o tema do comentário e a situação registrada do pedido.
+
+A análise exploratória sustenta a escolha de cada metadado:
+
+| Metadado | Evidência na base |
+|---|---|
+| `delivery_status` | Nota 1 em 53,8% dos pedidos atrasados, em 70,9% dos não entregues e em 6,6% dos entregues no prazo |
+| `purchase_month_num` | 11,9% das avaliações de compras de novembro de 2017 vêm de pedidos atrasados, contra 3,9% em outubro |
+| `score` | Clientes com nota 1 comentam em 76,5% dos casos, e clientes com nota 5 em 35,9% |
+| `category` | 73 categorias de produto disponíveis para filtro |
+| `state` | 27 UFs; o filtro usa a UF do cliente |
+
+Clientes com nota 1 escrevem mais, e isso distorce o índice. A nota 1 representa 11,5% da base e 22,0% dos documentos indexados. Por isso o `ReviewStats` calcula o panorama sobre as 98.410 avaliações da base analítica.
+
+## Avaliação
+
+O comando `python -m voc_rag.cli evaluate --judge` mede o pipeline e grava o relatório em [docs/avaliacao.md](docs/avaliacao.md) e o detalhe de cada pergunta em `data/eval/avaliacao.json`. Os casos ficam em `examples/eval_set.json`.
+
+### O que é medido
+
+- **Recuperação, precisão@10.** Para 8 temas (atraso, defeito, produto diferente, pedido incompleto, atendimento, devolução, embalagem e rapidez), o comando ordena as avaliações com a própria pergunta e conta quantas das 10 primeiras casam com a expressão regular do tema. Não existe gabarito anotado, então o rótulo é aproximado; ele serve para comparar as estratégias entre si. Quatro estratégias: só densa, híbrida, densa com rerank e híbrida com rerank.
+- **Respostas e recusas.** São 31 perguntas: 16 que a base responde e 15 que devem ser recusadas, entre fora do escopo, sem evidência, com condição essencial impossível (Lua, drone, videochamada, loja em Paris, atendimento em Libras, provador virtual), período fora da base e tentativa de injeção de prompt. Oito delas foram acrescentadas para a avaliação deixar de saturar: recortes estreitos (8 avaliações de Roraima com nota até 2, 35 do Acre), combinações de categoria com período ou situação de entrega e reclamações que não implicam nota. Elas estão divididas em dois grupos. O split `dev` (11 perguntas) serve para calibrar parâmetros, como `MIN_SIMILARITY`. O split `test` (20 perguntas) serve para relatar o resultado, sem ajuste. O relatório mostra a acurácia, as recusas indevidas, as respostas indevidas, os erros e a barreira que recusou cada pergunta.
+- **Ablação.** As perguntas rodam em quatro configurações: `baseline` (uma frase de busca, busca densa e corte de similaridade), `multi_query`, `hybrid` (com BM25) e `full` (com rerank). Todas recebem a mesma análise da pergunta em cada repetição, para isolar o efeito da recuperação.
+- **Extração de filtros.** Compara as condições extraídas com `expected_filters` nas perguntas que têm filtros esperados.
+- **Fundamentação.** Um LLM-juiz confere cada insight contra as avaliações que ele cita (sustentado, parcial ou não sustentado) e marca quando o insight atribui ao cliente algo que só está nos metadados do pedido. O relatório também conta os insights descartados pela validação de citações.
+- **Custo e tempo.** Tokens de entrada e saída e segundos por pergunta, em cada configuração.
+
+Com `--repeat N`, as perguntas rodam N vezes e a acurácia sai com média e desvio. Defina `JUDGE_PROVIDER` e `JUDGE_MODEL` com outro provedor: um juiz da mesma família do gerador tende a favorecer as próprias respostas, e o relatório avisa quando isso acontece.
+
+### Resultados
+
+Os números abaixo vêm de uma execução em 3 de novembro de 2026, com `gpt-5.6-luna` no chat, no rerank e no juiz, `text-embedding-3-small` nos embeddings e uma repetição. Essa execução tinha 22 perguntas; o caso de período fora da base ("Quem comprou e não chegou em 2025?") e a barreira de recorte vazio foram incluídos depois e entram na próxima execução. O relatório completo, com o resultado de cada pergunta, está em [docs/avaliacao.md](docs/avaliacao.md).
+
+**Recuperação, precisão@10**
+
+| Tema | Densa | Híbrida | Densa + rerank | Híbrida + rerank |
+|---|---|---|---|---|
+| Atraso na entrega | 1,00 | 1,00 | 1,00 | 1,00 |
+| Produto com defeito ou quebrado | 0,90 | 1,00 | 0,90 | 1,00 |
+| Produto diferente do anunciado | 1,00 | 1,00 | 1,00 | 1,00 |
+| Pedido incompleto | 1,00 | 1,00 | 1,00 | 1,00 |
+| Atendimento e comunicação | 0,50 | 0,50 | 0,60 | 1,00 |
+| Devolução ou reembolso | 0,90 | 1,00 | 0,90 | 1,00 |
+| Embalagem | 0,90 | 0,60 | 0,90 | 0,90 |
+| Elogio à rapidez da entrega | 0,90 | 0,70 | 0,90 | 0,90 |
+| **Média** | **0,89** | **0,85** | **0,90** | **0,97** |
+
+O BM25 sozinho piora a média, porque traz avaliações que repetem palavras da pergunta sem tratar do tema ("embalagem" e "rapidez" caem). O rerank sozinho quase não muda a ordem da busca densa. A combinação dos dois dá o melhor resultado: o BM25 amplia os candidatos, e o rerank descarta os que só coincidem nas palavras. O ganho maior aparece em "atendimento", em que a busca densa acerta metade.
+
+**Respostas e recusas**
+
+| Configuração | Acurácia dev (8) | Acurácia test (14) | Recusas indevidas | Respostas indevidas | Barreiras que recusaram | Tokens por pergunta (entrada/saída) | Segundos por pergunta |
+|---|---|---|---|---|---|---|---|
+| `baseline` | 0,88 | 1,00 | 1 | 0 | gerador: 7, escopo: 5 | 1.548 / 333 | 4,5 |
+| `multi_query` | 1,00 | 1,00 | 0 | 0 | gerador: 6, escopo: 5 | 1.833 / 384 | 6,6 |
+| `hybrid` | 1,00 | 1,00 | 0 | 0 | gerador: 6, escopo: 5 | 1.839 / 338 | 6,0 |
+| `full` | 1,00 | 1,00 | 0 | 0 | rerank: 6, escopo: 5 | 4.098 / 2.686 | 14,0 |
+
+Os tokens da tabela não incluem a análise da pergunta, comum a todas as configurações, com média de 1.728 de entrada e 160 de saída.
+
+- A configuração `baseline` recusou "Quais são os principais problemas relatados pelos clientes?". Com uma frase de busca só, as evidências cobriam um tema, e o gerador concluiu que não respondiam a uma pergunta de panorama. As várias frases de busca resolveram o caso.
+- O corte de cosseno de 0,40 não recusou nenhuma pergunta. A maior similaridade das perguntas sem base (drone, criptomoedas, Lua, milhas, videochamada e cashback) ficou entre 0,58 e 0,73, na mesma faixa das perguntas com resposta (de 0,71 a 0,95). A similaridade mede proximidade de assunto, e "entrega por drone" fica perto de "entrega". Sem o rerank, quem recusou essas perguntas foi o gerador, depois de receber as evidências.
+- Com o rerank, a nota máxima dessas perguntas foi 1, e a das perguntas com resposta foi 3. Elas foram recusadas antes do gerador. As perguntas fora do tema e a tentativa de injeção de prompt pararam na checagem de escopo.
+- O rerank mais que dobra os tokens e o tempo, porque o mesmo modelo de raciocínio do chat dá as notas. Um `RERANK_MODEL` mais barato reduz esse custo; rode a avaliação de novo para confirmar que as recusas se mantêm.
+
+**Fundamentação, pelo juiz**
+
+| Configuração | Insights | Sustentados | Parciais | Não sustentados | Metadado atribuído ao cliente |
+|---|---|---|---|---|---|
+| `baseline` | 32 | 29 | 3 | 0 | 0 |
+| `multi_query` | 48 | 44 | 4 | 0 | 1 |
+| `hybrid` | 50 | 43 | 7 | 0 | 1 |
+| `full` | 53 | 49 | 4 | 0 | 0 |
+
+Nenhum insight foi julgado sem sustentação, e a validação de citações não precisou descartar nenhum. A configuração `full` gera mais insights, porque cobre mais subtemas, com a maior proporção de sustentados (49 de 53). O juiz é o mesmo modelo do gerador e tende a favorecer as próprias respostas; trate esses números como indicativos.
+
+**Extração de filtros:** 7 de 8 perguntas acertaram todas as condições. Em "Do que os clientes reclamaram nas compras de novembro de 2017?", o analisador acrescentou `score <= 2` ao filtro de mês, tratando "reclamaram" como nota baixa.
+
+**Configuração padrão:** a ablação sustenta deixar os três componentes ligados. As várias frases de busca corrigem a recusa indevida, o BM25 com o rerank dá a melhor precisão, e o rerank é a única barreira que separa as perguntas sem base antes do gerador.
+
+**Limites da avaliação:** 22 perguntas e uma repetição medem a direção dos efeitos, não a variação entre execuções; use `--repeat 3` para obter média e desvio. A relevância da recuperação usa expressões regulares, e o juiz é da mesma família do gerador.
+
+### Recuperação com os modelos locais
+
+Medição feita em 7 de novembro de 2026 sobre a base completa (39.192 documentos), sem LLM, com o script de ranking de `evaluate_retrieval`: a própria pergunta como frase de busca, sem corte de similaridade e sem o corte do reranker.
+
+| Item | Valor |
+|---|---|
+| Indexação (E5 small, CPU) | 10 min 18 s, uma vez; índice FAISS de 57 MB |
+| Carga do pipeline | 13 s (modelos, índice e BM25) |
+| Busca densa por frase | 43 ms |
+| Rerank de 30 candidatos por frase | cerca de 0,9 s na CPU |
+| Pergunta de panorama (6 frases: densa, BM25, rerank e MMR) | 4,6 s, 0 tokens |
+
+| Configuração | Precisão@10 (E5 + FAISS + cross-encoder) | Precisão@10 na execução anterior (OpenAI + rerank por LLM) |
+|---|---|---|
+| `dense` | 0,84 | 0,89 |
+| `hybrid` | 0,81 | 0,85 |
+| `dense_rerank` | 0,91 | 0,90 |
+| `hybrid_rerank` | 0,91 | 0,97 |
+
+O cross-encoder eleva a precisão de 0,84 para 0,91, sem tokens. O rerank por LLM chegou a 0,97, mas custava cerca de 2.300 tokens de entrada e 2.300 de saída e 8 segundos a mais por pergunta. Os temas mais fracos com o cross-encoder são os abstratos ("Como os clientes avaliam o atendimento?", 0,60): o modelo foi treinado com perguntas concretas e funciona melhor com as frases no estilo do cliente que o analisador escreve.
+
+Pré-filtro do FAISS contra a alternativa de filtrar depois de uma busca global, para a frase "o produto chegou atrasado":
+
+| Recorte | Avaliações no recorte | Candidatas com pré-filtro | Pós-filtro sobre os 40 mais próximos | Pós-filtro sobre os 400 mais próximos |
+|---|---|---|---|---|
+| Estado AC | 35 | 35 | 1 | 2 |
+| Estado RR e nota até 2 | 8 | 8 | 0 | 0 |
+| Categoria `bebes` e nota até 2 | 317 | 40 | 0 | 7 |
+| Não entregues em 2018-08 | 95 | 40 | 0 | 2 |
+
+Os números de respostas, recusas e fundamentação acima vêm da execução anterior, com OpenAI. A execução de 7 de novembro de 2026 com os modelos locais e `gemini-3.5-flash-lite` no chat e no juiz, sobre as 31 perguntas, está em [docs/avaliacao.md](docs/avaliacao.md). `baseline`, `multi_query` e `hybrid` acertaram todas; a `full` ficou com acurácia 0,91 em dev e 0,95 em test, porque o corte do cross-encoder recusou os dois recortes estreitos (Acre e Roraima com nota até 2), que ficaram com 2 evidências cada, abaixo do mínimo de 3. Em troca, a `full` teve a melhor fundamentação (50 de 53 insights sustentados, contra 51 de 58 na `hybrid`), recusou no rerank perguntas sem base antes do gerador e gastou 1.258 tokens de entrada e 201 de saída e 3,2 s por pergunta. Os 13 filtros esperados foram extraídos corretamente. Nenhuma configuração respondeu a uma pergunta que deveria recusar. Como o modelo de chat mudou, a comparação com a execução anterior mistura o efeito do rerank local com o do modelo.
+
+## Principais decisões técnicas
+
+| Decisão | Alternativa descartada | Motivo |
+|---|---|---|
+| FAISS exato (`IndexFlatIP`) com pré-filtro por `IDSelectorBatch` | Chroma (HNSW aproximado) ou Qdrant/pgvector em servidor | 39 mil vetores cabem em memória, a busca exata leva milissegundos e o filtro entra antes da busca, sem perder candidatas em recortes pequenos; o Chroma continua disponível com `VECTOR_STORE=chroma` |
+| Um documento por avaliação | Chunking | O comentário mais longo tem 208 caracteres |
+| `review_id` como ID do documento | Posição da linha no parquet | O ID não muda quando a base é reconstruída |
+| Embeddings E5 e cross-encoder locais; LLM por API só para análise e geração | Todos os modelos por API | Indexar e reranquear não custam nada, funcionam offline e são reproduzíveis; o preço é instalar o PyTorch CPU |
+| Uma chamada de LLM para escopo, tipo, frases de busca e filtros | Chamadas separadas | Menos latência e custo |
+| Categoria aproximada por `difflib` | Descartar a categoria com grafia diferente | O LLM escreve "cama, mesa e banho" e a base guarda `cama_mesa_banho`; sem a aproximação, o filtro sumiria |
+| Várias frases de busca em perguntas de panorama | Uma frase só | Cada subtema ganha sua busca e suas vagas no contexto |
+| Busca híbrida, densa e BM25, com RRF | Só busca densa | O BM25 acha termos exatos que a busca densa perde |
+| BM25 em memória | Busca híbrida do banco vetorial | Nem o FAISS nem o Chroma local oferecem BM25; em memória, ele usa a mesma máscara de filtros do FAISS |
+| Cross-encoder local (`mmarco-mMiniLMv2`) como rerank padrão | Rerank por LLM com nota de 0 a 3 | Determinístico, sem custo e com score contínuo, que permite calibrar o corte; o rerank por LLM continua disponível com `RERANKER=llm`, para quem quer cobrar condições essenciais da pergunta original |
+| Corte de cosseno antes do rerank | Rerank de todos os candidatos | Descarta candidatos distantes antes do cross-encoder |
+| Cota por frase e MMR | Só os maiores scores | Um tema com frases muito diretas não ocupa todas as vagas |
+| Saída estruturada com IDs | Resposta em texto livre | O código consegue validar as citações |
+| Panorama calculado com pandas | Pedir frequências ao LLM | O LLM vê no máximo 20 avaliações e não tem como estimar frequências da base |
+| Metadados separados do texto do cliente no contexto | Metadados e texto no mesmo bloco | Evita atribuir ao cliente um atraso que só consta nos dados do pedido |
+| Regras de reserva quando o LLM falha, com aviso | Só status de erro | A busca e as evidências continuam disponíveis sem chave, sem cota ou em timeout; o aviso deixa claro que o escopo não foi verificado. Se a geração falhar, o status de erro mantém as evidências e a interface oferece nova tentativa |
+| Sem campo de "confiança" na resposta | Confiança autodeclarada pelo LLM | O número não é calibrado; as barreiras e o rastreio dizem por que a resposta saiu |
+| Nota como filtro | Campo de sentimento derivado da nota | O sentimento repetiria a nota com outro nome; testamos o campo e o LLM continuou preferindo `score <= 2` para "clientes insatisfeitos" |
+| Classes com fluxo linear | LangGraph | O fluxo tem saídas antecipadas simples, e um grafo aumentaria o código |
+| Avaliação com split dev e test | Calibrar e medir nas mesmas perguntas | Evita ajustar o corte às perguntas usadas para relatar o resultado |
+
+## Como executar
+
+Você precisa de Python 3.11 ou superior. A chave de API da OpenAI ou do Google Gemini é usada na análise da pergunta e na síntese; sem ela, a busca funciona com as regras de reserva. Na primeira execução, o `sentence-transformers` baixa o E5 (cerca de 470 MB) e o cross-encoder (cerca de 470 MB) do Hugging Face.
+
+```bash
+git clone <url-do-repositorio>
+cd voc-rag-olist
+python -m venv .venv
+source .venv/bin/activate        # Linux/macOS; no Windows veja a tabela abaixo
+pip install -r requirements.txt
+cp .env.example .env             # preencha a chave do provedor
 ```
-voice_customer_intelligence/
-  src/
-    voc_rag/             núcleo da solução (pacote Python)
-      config.py          caminhos, modelos e parâmetros
-      preparacao.py      seleção, limpeza, valores ausentes e metadados
-      indexacao.py       embeddings e índice FAISS
-      filtros.py         filtros de metadados
-      consulta.py        processamento da pergunta
-      recuperacao.py     busca híbrida, reranking, limiar e MMR
-      geracao.py         contexto, prompt e validação das citações
-      llm.py             criação do LLM (Gemini ou OpenAI)
-      pipeline.py        orquestra as etapas
-    app.py               interface web (Streamlit)
-    perguntar.py         interface de linha de comando
-    avaliar.py           avaliação da solução
-    gerar_exemplos.py    gera docs/exemplos.md
-  data/                  CSVs da Olist (não versionados)
-  artefatos/             base e índice gerados (não versionados)
-  docs/                  exemplos e roteiro do vídeo
-  pyproject.toml         declara o pacote voc_rag
-  requirements.txt
-  .env.example           modelo das variáveis de ambiente (versionado)
-  .env                   variáveis locais, como a chave da API (não versionado)
+
+O comando de ativação do ambiente virtual depende do terminal:
+
+| Terminal | Comando |
+|---|---|
+| Linux/macOS (bash/zsh) | `source .venv/bin/activate` |
+| Windows PowerShell | `.\.venv\Scripts\Activate.ps1` |
+| Windows CMD | `.venv\Scripts\activate.bat` |
+| Windows Git Bash | `source .venv/Scripts/activate` |
+
+O `source` só existe no Bash. No PowerShell, ele gera o erro "O termo 'source' não é reconhecido como nome de cmdlet". Se o PowerShell bloquear o script com o aviso "a execução de scripts foi desabilitada neste sistema", libere a execução para o seu usuário e ative de novo:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
 ```
 
-## 3. Tecnologias
+O ambiente está ativo quando `(.venv)` aparece no início do prompt.
 
-- Python 3.12, com pandas para juntar os CSVs e Parquet para guardar a base preparada.
-- Embeddings: `intfloat/multilingual-e5-small`. Escolhemos esse modelo porque ele foi treinado
-  para busca do tipo "pergunta curta encontra o trecho que responde", funciona bem em português,
-  roda em CPU e não tem custo. Modelos de paráfrase, como o MiniLM, são pensados para comparar
-  frases parecidas entre si, o que é outro problema.
-- Índice vetorial: FAISS (`IndexFlatIP`). Com 42 mil vetores de 384 dimensões (uns 60 MB), a
-  busca exata leva milissegundos, então não compensa usar um índice aproximado e perder
-  resultados. O filtro por metadados usa `IDSelectorBatch`.
-- Busca lexical: BM25 (`rank_bm25`), algoritmo clássico de busca por palavras, que pontua cada
-  avaliação pela frequência dos termos da consulta. Serve para termos exatos como "nota fiscal" ou "correios".
-- Fusão dos rankings: Reciprocal Rank Fusion (RRF), que combina as duas listas pela posição e
-  dispensa normalizar os scores.
-- Reranker: `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`, treinado no mMARCO (que inclui
-  português). Ele lê a consulta e a avaliação juntas, por isso é mais preciso que a busca
-  vetorial, e o score dele também serve de limiar de relevância.
-- LLM: Google Gemini via LangChain (`langchain-google-genai`), com saída estruturada em
-  Pydantic (`with_structured_output`). É possível trocar para OpenAI pelo `.env`. O código pede
-  temperatura 0, mas os modelos Gemini 3.x usam parâmetros de amostragem fixos e ignoram esse
-  valor (a biblioteca avisa isso no terminal); a temperatura só tem efeito em modelos que a
-  aceitam, como os da OpenAI.
-- Interface: Streamlit, além de uma versão em linha de comando.
-
-## 4. Instalação e execução
-
-Pré-requisitos: Python 3.12, os CSVs da Olist na pasta `data/` do projeto (ou em outro caminho
-informado em `VOC_PASTA_DADOS` no `.env`) e uma chave de API do Gemini ou da OpenAI (veja
-[Chave de API do LLM](#chave-de-api-do-llm)).
-
-### Dados
-
-Os dados não estão no repositório. Baixe o Brazilian E-Commerce Public Dataset by Olist no
-Kaggle (https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce; é preciso ter uma conta
-gratuita), descompacte e coloque na pasta `data/` os cinco arquivos usados pelo projeto:
+Baixe a base em https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce e coloque os arquivos em `data/raw/`. O pipeline usa estes cinco:
 
 - `olist_order_reviews_dataset.csv`
 - `olist_orders_dataset.csv`
@@ -141,603 +364,126 @@ gratuita), descompacte e coloque na pasta `data/` os cinco arquivos usados pelo 
 - `olist_products_dataset.csv`
 - `olist_customers_dataset.csv`
 
-O pacote tem outros quatro arquivos, que podem ficar na pasta, mas não são lidos. O projeto
-consulta os comentários dos clientes, e os metadados servem só para filtrar e contextualizar
-essas avaliações, então ficaram de fora as tabelas que não acrescentavam nada a isso:
+O notebook de EDA descreve as oito tabelas e também lê `olist_order_payments_dataset.csv`, `olist_sellers_dataset.csv` e `product_category_name_translation.csv`.
 
-| Arquivo | Conteúdo | Por que não foi usado |
+Prepare a base, crie o índice e abra a interface:
+
+```bash
+python -m voc_rag.cli prepare
+python -m voc_rag.cli index
+streamlit run app.py
+```
+
+Para rodar os testes, que não chamam a API:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Para perguntar pelo terminal, gerar os exemplos ou avaliar:
+
+```bash
+python -m voc_rag.cli ask "O que os clientes relatam sobre problemas de entrega?"
+python -m voc_rag.cli examples
+python -m voc_rag.cli evaluate --judge                 # 31 perguntas em 4 configurações
+python -m voc_rag.cli evaluate --split dev --configs full
+```
+
+| Variável do `.env` | Padrão | Uso |
 |---|---|---|
-| `olist_geolocation_dataset.csv` | latitude e longitude por prefixo de CEP | a UF do cliente, que já vem em `olist_customers_dataset.csv`, basta para o filtro geográfico |
-| `olist_order_payments_dataset.csv` | forma de pagamento, parcelas e valor pago | nenhum filtro ou análise do projeto depende do pagamento; o valor dos itens já vem de `olist_order_items_dataset.csv` |
-| `olist_sellers_dataset.csv` | cidade e UF de cada vendedor | o projeto analisa a experiência do cliente, sem recorte por vendedor |
-| `product_category_name_translation.csv` | nome das categorias em inglês | a base e a interface usam os nomes em português |
+| `LLM_PROVIDER` | `openai` | Provedor do chat (e do rerank com `RERANKER=llm`): `openai` ou `google` |
+| `OPENAI_API_KEY` ou `GOOGLE_API_KEY` | sem padrão | Chave do provedor |
+| `CHAT_MODEL` | `gpt-5.6-luna` | Modelo de análise e geração |
+| `RERANKER` | `cross_encoder` | `cross_encoder` (local) ou `llm` |
+| `CROSS_ENCODER_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder do rerank local |
+| `MIN_RERANK_SCORE` | `-1.0` | Logit mínimo do cross-encoder |
+| `RERANK_MODEL` | o `CHAT_MODEL` | Modelo do rerank com `RERANKER=llm`; use um modelo barato do mesmo provedor |
+| `JUDGE_PROVIDER` e `JUDGE_MODEL` | os do chat | Juiz da avaliação; use outro provedor para reduzir o viés |
+| `LLM_TEMPERATURE` | não enviada | Defina só para modelos que aceitam temperatura |
+| `EMBEDDING_PROVIDER` | `local` | Provedor dos embeddings: `local`, `openai` ou `google` |
+| `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | Modelo de embeddings |
+| `VECTOR_STORE` | `faiss` | Banco vetorial: `faiss` ou `chroma` |
+| `MIN_SIMILARITY` | `0.80` no E5, `0.40` nos modelos por API | Similaridade mínima para um candidato seguir na busca |
+| `USE_MULTI_QUERY`, `USE_BM25`, `USE_RERANK` | `true` | Componentes da busca |
 
-Pagamento e vendedor poderiam virar filtros numa versão futura (por exemplo, problemas
-relatados por região do vendedor). O dataset é publicado pela Olist sob a licença CC BY-NC-SA
-4.0.
+Se você trocar o modelo de embeddings, rode `index` de novo e recalibre `MIN_SIMILARITY`.
 
-### Ambiente
+## Notebooks
 
-Sistemas suportados: Windows (x64), Linux (x64 ou ARM) e macOS com Apple Silicon (M1 ou mais
-novo). Macs com processador Intel não são suportados, porque o PyTorch 2.5.1 não tem versão
-para eles. O `requirements.txt` escolhe sozinho a versão do PyTorch adequada a cada sistema.
+A pasta `notebooks/` tem dois notebooks para leitura e apresentação visual dos dados.
 
-Windows (PowerShell):
+O `01_eda_e_montagem_da_base.ipynb` descreve as oito tabelas da Olist, com o significado de cada coluna e a distribuição dos valores. Em seguida, testa as ligações entre tabelas, monta a tabela final passo a passo e confere que o resultado é igual à saída da `ReviewDataPreparer`. Ele roda sem a API.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install -e .
-copy .env.example .env
-```
-
-Se o PowerShell bloquear a ativação do ambiente, rode antes
-`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. No Prompt de Comando (cmd), a ativação é
-`.venv\Scripts\activate.bat`.
-
-Linux e macOS:
+O `02_pipeline_rag_passo_a_passo.ipynb` executa o pipeline uma etapa por vez. Você vê o documento, os embeddings, as frases de busca, os filtros, os candidatos do FAISS, o funil da busca híbrida com o rerank, as evidências, o prompt, a resposta e a validação das citações. A última seção compara a similaridade de perguntas com e sem resposta na base. Ele precisa da chave da API no `.env`.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
-cp .env.example .env
+jupyter notebook notebooks/
 ```
 
-Em todos os casos, depois edite o `.env` e preencha a chave de API do provedor escolhido (veja
-abaixo). O `pip install -e .` instala o pacote `voc_rag` em modo editável, para que os scripts o
-encontrem de qualquer pasta.
+## Exemplos de perguntas e respostas
 
-O ambiente virtual guarda caminhos absolutos: o `pip install -e .` grava o caminho da pasta
-`src/`, e os executáveis em `.venv/Scripts` (como `streamlit.exe`) gravam o caminho do Python do
-`.venv`. Se a pasta do projeto for movida ou renomeada depois da instalação, apague o `.venv` e
-refaça os passos acima. O sintoma é um erro ao rodar `streamlit`, como
-`failed to canonicalize script path`, ou `ModuleNotFoundError: No module named 'voc_rag'`.
+O arquivo `examples/questions.json` reúne 12 perguntas com os exemplos do enunciado, os filtros do desafio adicional e dois casos de recusa. Cada pergunta traz o status e os filtros esperados. O comando `python -m voc_rag.cli examples` roda as 12, confere esses valores no terminal e grava em `docs/exemplos.md` a resposta, as frases de busca, os filtros e a tabela de evidências de cada uma.
 
-### Chave de API do LLM
-
-O projeto funciona com Gemini (padrão) ou OpenAI. Basta uma das duas chaves.
-
-Gemini (Google AI Studio, tem cota gratuita):
-
-1. Acesse https://aistudio.google.com/apikey e entre com uma conta Google.
-2. Clique em "Create API key" e copie a chave gerada.
-3. No `.env`, preencha `GOOGLE_API_KEY`.
-
-OpenAI (pago por uso, exige créditos na conta):
-
-1. Acesse https://platform.openai.com/api-keys e entre com sua conta.
-2. Clique em "Create new secret key" e copie a chave (ela só é exibida uma vez).
-3. Instale a integração: `pip install langchain-openai`.
-4. No `.env`, descomente e preencha `LLM_PROVIDER=openai` e `OPENAI_API_KEY`.
-
-O modelo de cada provedor é definido em `GEMINI_CHAT_MODEL` e `OPENAI_CHAT_MODEL`. Os
-provedores retiram modelos antigos com o tempo; se aparecer um erro de modelo não encontrado
-(404), troque o nome por um modelo disponível na documentação do provedor.
-
-A chave fica só no `.env`, que não é versionado. Não coloque a chave no código nem no
-`.env.example`.
-
-Os comandos a seguir são iguais em todos os sistemas, com o ambiente virtual ativado.
-
-Para construir a base (só uma vez; os embeddings levam uns 10 minutos em CPU):
-
-```bash
-python -m voc_rag.preparacao     # gera artefatos/documentos.parquet
-python -m voc_rag.indexacao      # gera artefatos/indice_faiss.bin
-```
-
-Para usar:
-
-```bash
-streamlit run src/app.py                                              # interface web
-python src/perguntar.py "O que os clientes relatam sobre a entrega?"  # linha de comando
-python src/avaliar.py --juiz                                          # avaliação completa
-python src/gerar_exemplos.py                                          # regenera docs/exemplos.md
-```
-
-Na primeira execução, os modelos de embeddings e de reranking (cerca de 940 MB) são baixados do
-Hugging Face e ficam no cache do usuário: `~/.cache/huggingface/hub` no Linux e no macOS, e
-`C:\Users\<usuário>\.cache\huggingface\hub` no Windows. O local pode ser alterado com a
-variável `HF_HOME`.
-
-### Limpeza / desinstalação
-
-Nada do que o projeto gera é removido automaticamente. São três lugares:
-
-- `.venv/`, o ambiente virtual (uns 2 GB): basta apagar a pasta.
-- `artefatos/`, a base e o índice gerados (uns 70 MB): pode apagar e recriar com
-  `preparacao` e `indexacao`.
-- o cache do Hugging Face com os modelos (uns 940 MB), que fica fora do projeto.
-
-O cache do Hugging Face não expira e continua lá mesmo depois de apagar o projeto ou o `.venv`,
-porque é compartilhado entre projetos para evitar downloads repetidos. Para liberar espaço:
-
-```bash
-# Ver o que está no cache e quanto ocupa
-hf cache scan
-
-# Remover interativamente (menu de seleção; requer: pip install InquirerPy)
-hf cache delete
-
-# Sem menu: abre um arquivo de texto para marcar o que apagar (não requer InquirerPy)
-hf cache delete --disable-tui
-```
-
-Os comandos antigos `huggingface-cli scan-cache` e `delete-cache` ainda funcionam, mas estão
-depreciados em favor da CLI `hf`. Também dá para apagar diretamente as pastas dos dois modelos.
-
-Windows (PowerShell):
-
-```powershell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\models--intfloat--multilingual-e5-small"
-Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface\hub\models--cross-encoder--mmarco-mMiniLMv2-L12-H384-v1"
-```
-
-Linux e macOS:
-
-```bash
-rm -rf ~/.cache/huggingface/hub/models--intfloat--multilingual-e5-small
-rm -rf ~/.cache/huggingface/hub/models--cross-encoder--mmarco-mMiniLMv2-L12-H384-v1
-```
-
-Se forem apagados, os modelos são baixados de novo na próxima execução (precisa de internet).
-
-## 5. Construção da base de conhecimento
-
-### Seleção dos dados
-
-Código: `src/voc_rag/preparacao.py`
-
-A fonte principal é `olist_order_reviews_dataset.csv`, com 99.224 avaliações. As demais tabelas
-(pedidos, clientes, itens e produtos) servem apenas para enriquecer cada avaliação com
-metadados.
-
-Só entram na base as avaliações que têm algum texto, já que sem texto não há o que buscar. No
-CSV, quase 60% das avaliações não têm mensagem. Quando há só o título (por exemplo, "Entrega pela
-metade"), a avaliação é aproveitada. O caminho até a base final:
-
-| Etapa | Avaliações |
-|---|---|
-| CSV original | 99.224 |
-| Depois de remover `review_id` duplicados | 98.410 |
-| Sem título e sem mensagem (removidas) | 56.040 |
-| Texto sem conteúdo útil, com menos de 3 letras (removidas) | 419 |
-| Documentos na base | 41.951 |
-
-Sobre as duplicatas: 789 `review_id` aparecem ligados a 2 ou 3 pedidos (814 linhas a mais), e
-em todos os casos a nota e o texto são iguais. Mantivemos uma ocorrência de cada para não contar a
-mesma avaliação mais de uma vez.
-
-### Limpeza e preparação dos textos
-
-Código: `src/voc_rag/preparacao.py` e `src/voc_rag/recuperacao.py`
-
-A limpeza foi mínima, de propósito. Os passos aplicados:
-
-- normalização Unicode NFC (que padroniza letras acentuadas em uma única forma de codificação),
-  porque a palavra "Ótimo" aparecia com duas codificações diferentes;
-- quebras de linha e tabs viram espaço, e espaços repetidos são reduzidos a um;
-- pontuação repetida é encurtada ("!!!!!!" vira "!!!"), sem perder a ênfase do cliente;
-- e-mails, telefones, CPFs e URLs são mascarados (LGPD), para que dados pessoais não cheguem aos
-  embeddings nem ao LLM;
-- textos com menos de 3 letras, como ".", "1" ou "ok", são descartados.
-
-Acentos, maiúsculas e stopwords foram mantidos. O modelo de embeddings foi treinado com texto
-natural, e tirar uma stopword como "não" inverteria o sentido de "não chegou".
-
-O BM25 usa uma tokenização própria: tudo em minúsculas, sem acentos, sem stopwords e com um
-stemming simples, que corta as palavras em 5 letras (entrega, entregue e entregaram viram
-`entre`).
-
-### Valores ausentes
-
-Código: `src/voc_rag/preparacao.py`
-
-- Título ou mensagem nulos viram texto vazio. O texto final junta título e mensagem, e o título
-  é omitido quando já aparece dentro da mensagem. A grande maioria das avaliações não tem título.
-- Pedido sem data de entrega recebe `status_entrega = nao_entregue`.
-- Produto sem categoria recebe "sem categoria"; cliente sem estado (UF) recebe "ND".
-- Campos numéricos ausentes, como dias de atraso, recebem o valor -999.
-
-### Organização dos documentos
-
-Código: `src/voc_rag/preparacao.py`
-
-Cada avaliação é um documento, sem divisão em pedaços (chunking). As mensagens têm no máximo
-208 caracteres (229 com o título), e metade dos textos tem até 54, então cada um já é uma
-unidade completa de sentido.
-
-Junto com o texto, cada documento guarda: `review_id`, `order_id`, nota, sentimento (nota 1-2
-negativo, 3 neutro, 4-5 positivo), categoria do produto (a do item mais caro do pedido),
-situação da entrega (`no_prazo`, `atrasado` ou `nao_entregue`), dias de atraso, tempo de entrega,
-UF, mês da compra e data da avaliação.
-
-### Embeddings
-
-Código: `src/voc_rag/indexacao.py`
-
-O E5 espera um prefixo em cada texto: `"passage: "` nos documentos e `"query: "` nas consultas.
-Os vetores são normalizados, assim o produto interno é igual à similaridade de cosseno. Somente o
-texto da avaliação é vetorizado; os metadados ficam de fora para não pesarem demais em textos tão
-curtos e são usados como filtros.
-
-### Armazenamento e indexação
-
-Código: `src/voc_rag/indexacao.py` e `src/voc_rag/recuperacao.py`
-
-- `artefatos/documentos.parquet` guarda os textos e os metadados.
-- `artefatos/indice_faiss.bin` guarda os vetores. O id de cada vetor é a posição da avaliação no
-  Parquet, o que liga as duas partes.
-- O índice BM25 é montado em memória quando a aplicação inicia, em poucos segundos.
-
-## 6. Pipeline RAG
-
-### 6.1 Transformação da pergunta
-
-Código: `src/voc_rag/consulta.py`
-
-O LLM recebe a pergunta e devolve um objeto Pydantic como este:
-
-```json
-{
-  "dentro_do_escopo": true,
-  "tipo": "panorama",
-  "consultas_busca": ["o produto veio com defeito e estragado",
-                      "a entrega atrasou muito e não chegou no prazo",
-                      "recebi o produto errado ou incompleto",
-                      "o atendimento foi ruim e não tive suporte",
-                      "produto de péssima qualidade e propaganda enganosa"],
-  "sentimentos": ["negativo"]
-}
-```
-
-Nessa etapa acontecem três coisas.
-
-Primeiro, a verificação de escopo: perguntas que não têm relação com a experiência dos clientes
-são recusadas antes de qualquer busca.
-
-Segundo, a reescrita da pergunta em subconsultas (multi-query). A pergunta do gestor não é usada
-diretamente na busca. O LLM a transforma em frases concretas, do jeito que um cliente escreveria
-na avaliação: de 4 a 6 subtemas para perguntas de panorama e 1 ou 2 frases para perguntas
-específicas. Cada subconsulta é buscada e reranqueada separadamente.
-
-O motivo é o funcionamento do reranker. Ele foi treinado para comparar uma busca com o trecho
-que a responde, e uma pergunta abstrata sobre "problemas" não se parece com nenhuma avaliação.
-A tabela mostra o score da avaliação mais relevante encontrada para cada formulação (60
-candidatas por consulta, dentro do recorte de avaliações negativas, com 10.836 avaliações) e
-quantas ficaram acima do limiar de relevância (score >= 0). Os números vêm da parte A2 de
-`python src/avaliar.py --so-recuperacao`:
-
-| Consulta usada na busca | Melhor score | Acima do limiar |
+| Tipo | Pergunta | Comportamento esperado |
 |---|---|---|
-| Pergunta original, sem reescrita: "Quais são os principais problemas relatados pelos clientes?" | -1,6 | 0 |
-| Palavras-chave da pergunta: "problemas insatisfação defeito atraso reclamação" | -2,8 | 0 |
-| Subconsulta reescrita: "o produto chegou atrasado" | +6,0 | 33 |
-| Subconsulta reescrita: "o produto veio com defeito ou quebrado" | +6,1 | 37 |
+| Reclamações | Quais são os principais problemas relatados pelos clientes em suas avaliações? | Resposta com citações |
+| Tema específico | O que os clientes relatam sobre problemas relacionados à entrega? | Resposta com citações, sem filtro de entrega |
+| Experiências positivas | Quais aspectos da experiência de compra são mais elogiados pelos clientes? | Filtro `score >= 4` |
+| Insatisfação | Quais padrões podem ser identificados nas avaliações de clientes insatisfeitos? | Filtro `score <= 2` |
+| Evidências | Quais avaliações sustentam a conclusão de que existem problemas recorrentes relacionados ao prazo de entrega? | Resposta com citações |
+| Nota baixa | Quais são os principais problemas relatados nas avaliações com nota baixa? | Filtro `score <= 2` |
+| Categoria | O que os clientes mais elogiam em produtos de cama, mesa e banho? | Filtros `category` e `score >= 4` |
+| Entrega atrasada | Quais temas aparecem nas avaliações de pedidos entregues com atraso? | Filtro `delivery_status == atrasado` |
+| Período | Do que os clientes reclamaram nas compras de novembro de 2017? | Filtro de mês |
+| Estado | O que os clientes de São Paulo reclamam sobre a entrega? | Filtro `state in [SP]` |
+| Fora do escopo | Qual é a previsão do tempo para São Paulo amanhã? | Recusa antes da busca |
+| Sem evidência | O que os clientes dizem sobre o programa de cashback em criptomoedas da loja? | Evidência insuficiente |
 
-Um score negativo quer dizer que nem a melhor avaliação encontrada foi considerada relevante. Sem
-a reescrita, essa pergunta seria recusada por falta de evidências, mesmo havendo milhares de
-reclamações na base.
-
-Terceiro, a identificação de filtros implícitos. "Clientes insatisfeitos" vira
-`sentimentos=["negativo"]`; "categoria cama mesa banho" vira `categorias=[...]`, conferida contra
-as categorias que existem na base por aproximação de texto.
-
-Os filtros escolhidos na barra lateral também entram no prompt, como contexto. Assim as
-subconsultas são escritas para o recorte que vai ser buscado. Com a categoria "cama mesa banho"
-escolhida na barra lateral e a pergunta "Quais são os principais problemas?", por exemplo, as
-subconsultas passam a incluir temas próprios desses produtos, como cor diferente do anunciado e
-tecido de má qualidade, em vez de só temas genéricos.
-
-Se o LLM não estiver disponível, um conjunto de regras simples faz esse papel para o pipeline
-continuar funcionando.
-
-### 6.2 Recuperação
-
-Código: `src/voc_rag/recuperacao.py`
-
-Para cada subconsulta, já dentro do recorte definido pelos filtros:
-
-1. busca vetorial no FAISS, com as 100 avaliações mais próximas;
-2. busca BM25, também com 100;
-3. fusão das duas listas com RRF (k=60);
-4. reranking dos melhores candidatos com o cross-encoder.
-
-### 6.3 Seleção das evidências
-
-Código: `src/voc_rag/recuperacao.py`
-
-Depois do reranking, as avaliações com score abaixo de 0 são descartadas. Textos idênticos são
-agrupados em uma única evidência com contador. A comparação ignora maiúsculas e pontuação, e
-isso faz diferença: "muito bom" aparece quase 600 vezes na base, e "bom" e "recomendo", mais de
-400 vezes cada.
-
-O número de avaliações enviadas ao LLM é limitado: no máximo 20 para perguntas de panorama e 10
-para perguntas específicas. Se essas posições fossem preenchidas apenas pelos maiores scores do
-reranker, um tema com frases muito diretas, como "entrega atrasada", poderia ocupar quase todas,
-e o LLM deixaria de ver os outros problemas.
-
-Por isso as posições são divididas igualmente entre as subconsultas que encontraram evidências.
-Na pergunta "Quais os principais problemas?", com 5 subconsultas (defeito, atraso, produto
-errado, atendimento e qualidade), cada uma fica com 4 das 20 posições. Dentro de cada tema, o
-MMR (Maximal Marginal Relevance, técnica que equilibra relevância e diversidade; lambda = 0,7)
-escolhe as avaliações mais relevantes que também sejam diferentes entre si,
-evitando quatro versões de "chegou atrasado". Se um tema encontrar menos avaliações do que a sua
-parte, as posições que sobram não são repassadas aos outros, e o contexto fica com menos de 20.
-
-### 6.4 Contexto
-
-Código: `src/voc_rag/geracao.py` (formatação das evidências) e `src/voc_rag/recuperacao.py`
-(estatísticas), reunidos em `src/voc_rag/pipeline.py`
-
-Cada evidência entra no prompt com um identificador e seus metadados:
+## Estrutura do repositório
 
 ```
-[E5] nota 1/5 | categoria: utilidades domesticas | entrega: atrasado (12 dias) | compra: 2018-03
-     | encontrada pela busca: "a entrega atrasou muito e não chegou no prazo"
-<avaliacao>ATRASO ENORME NA ENTREGA. A entrega está muito atrasada...</avaliacao>
+voc-rag-olist/
+├── app.py
+├── voc_rag/
+│   ├── cli.py
+│   ├── config.py
+│   ├── evaluation.py
+│   ├── generator.py
+│   ├── indexing.py
+│   ├── labels.py
+│   ├── lexical.py
+│   ├── llm.py
+│   ├── pipeline.py
+│   ├── preparation.py
+│   ├── prompts.py
+│   ├── query_analyzer.py
+│   ├── reranker.py
+│   ├── retriever.py
+│   ├── schemas.py
+│   ├── stats.py
+│   └── vector_store.py
+├── tests/                # testes sem API, com dublês do LLM e do banco vetorial
+├── notebooks/
+│   ├── 01_eda_e_montagem_da_base.ipynb
+│   └── 02_pipeline_rag_passo_a_passo.ipynb
+├── examples/
+│   ├── questions.json    # perguntas de exemplo com status e filtros esperados
+│   └── eval_set.json     # temas de recuperação e perguntas dev e test da avaliação
+├── docs/                 # exemplos.md, avaliacao.md, classes_e_funcoes.md e roteiro do vídeo
+├── data/raw/             # CSVs do Kaggle, fora do git
+├── data/faiss/           # índice FAISS e lista de IDs, um par por modelo de embeddings
+├── requirements.txt
+└── .env.example
 ```
 
-O prompt também recebe os filtros aplicados e algumas estatísticas calculadas no código sobre as
-evidências: nota média, distribuição por sentimento e por situação de entrega e as categorias mais
-frequentes. Assim o LLM não precisa estimar esses números.
+## Limitações
 
-### 6.5 Geração da resposta
-
-Código: `src/voc_rag/geracao.py`
-
-O LLM responde em formato estruturado: `evidencias_suficientes`, `resumo`,
-`insights` (cada um com título, descrição e IDs das evidências), `limitacoes` e `confianca`. O
-prompt pede que ele use apenas as avaliações fornecidas, cite os IDs em todo insight, fale em
-quantidades só em relação às evidências ("6 das 20") e trate o texto dos clientes como dado, nunca
-como instrução, o que protege contra prompt injection.
-
-## 7. Respostas fundamentadas e rastreabilidade
-
-Código: `src/voc_rag/geracao.py` e `src/app.py`
-
-Cada insight traz os IDs das avaliações que o sustentam, e a interface mostra o texto dessas
-avaliações logo abaixo dele.
-
-As citações também são conferidas no código. Formatos variados são aceitos ("[e3]", "E 3") e
-intervalos são expandidos ("E1-E4" vira E1, E2, E3 e E4). IDs que não existem no contexto são
-removidos, e um insight que fica sem nenhuma citação válida é descartado. Se nenhum insight
-sobrar, a resposta é recusada com uma mensagem fixa, em vez do resumo escrito pelo LLM, que
-afirmaria algo sem base. Assim a rastreabilidade não fica dependendo só do que o LLM decidiu
-escrever.
-
-Para cada evidência é possível ver `review_id`, `order_id`, nota, categoria, situação da entrega,
-score do reranker, posição nas buscas vetorial e BM25 e a subconsulta que a encontrou. Na aba
-"Rastreamento do pipeline" aparecem a pergunta processada, os filtros e quantas avaliações
-passaram por cada etapa, para cada subconsulta.
-
-## 8. Perguntas sem evidências suficientes
-
-Código: `src/voc_rag/pipeline.py`
-
-Nem toda pergunta deve ser respondida. Há dois casos em que o sistema prefere dizer "não sei" a
-inventar:
-
-- a pergunta não tem relação com as avaliações (por exemplo, "Qual o faturamento da Olist?");
-- a pergunta é sobre a experiência do cliente, mas a base não tem avaliações suficientes sobre o
-  assunto (por exemplo, "entregas feitas por drone", serviço que a Olist não oferece).
-
-Para isso, a pergunta passa por quatro verificações, na ordem em que acontecem no pipeline. Se
-qualquer uma falhar, o processamento para ali e o usuário recebe uma mensagem explicando o motivo,
-sem resposta gerada.
-
-| # | Verificação | Quando recusa | Onde está no código |
-|---|---|---|---|
-| 1 | Escopo | O LLM, ao processar a pergunta, conclui que ela não trata da experiência dos clientes | `src/voc_rag/consulta.py` |
-| 2 | Recorte vazio | Os filtros escolhidos (por exemplo, uma categoria e um mês sem avaliações) não deixam nenhuma avaliação para buscar | `src/voc_rag/recuperacao.py` |
-| 3 | Evidências mínimas | Depois da busca, menos de 3 avaliações têm score do reranker igual ou acima de 0 | `src/voc_rag/pipeline.py` |
-| 4 | Revisão do LLM | O LLM lê as evidências e indica que elas não respondem à pergunta, ou nenhum insight gerado tem citação válida | `src/voc_rag/geracao.py` |
-
-A ordem vai da verificação mais barata para a mais cara. As verificações 2 e 3 não chamam o LLM
-para gerar resposta, então uma pergunta sem base é recusada sem custo de geração.
-
-A verificação 3 é a principal proteção contra respostas sem base. O reranker dá a cada avaliação
-um score de relevância em relação à consulta: valores positivos indicam que a avaliação trata do
-assunto, e valores negativos, que não trata. Uma busca sempre devolve alguma avaliação, mesmo que
-o assunto não exista na base; o limiar serve para descartar essas avaliações pouco relacionadas. O
-mínimo de 3 evita que o sistema tire conclusões a partir de um ou dois comentários isolados. Os dois
-valores ficam em `src/voc_rag/config.py` (`LIMIAR_RERANK` e `MIN_EVIDENCIAS`) e podem ser
-ajustados pelo `.env`.
-
-Quando a recusa da verificação 3 acontece com filtros ativos, a mensagem mostra o recorte usado e
-quantas avaliações ele tinha. Se um filtro da barra lateral substituiu um valor diferente
-identificado na pergunta (por exemplo, sentimento positivo escolhido para uma pergunta sobre
-problemas), a mensagem também avisa, para o usuário perceber que o filtro pode ser a causa.
-
-A verificação 4 cobre o caso em que as avaliações passam pelo limiar, mas só tangenciam a
-pergunta. Na pergunta sobre drones, por exemplo, a busca pode trazer avaliações genéricas sobre
-entrega; o LLM então informa que nenhuma delas fala do assunto perguntado.
-
-O comportamento dessas verificações é medido na seção 10, na tabela de recusas.
-
-## 9. Metadados (desafio adicional)
-
-Código: `src/voc_rag/filtros.py`, `src/voc_rag/recuperacao.py` e `src/app.py`
-
-Os metadados podem ser usados como filtros, tanto os identificados automaticamente na pergunta
-quanto os escolhidos na barra lateral da interface: nota, sentimento, categoria, situação da
-entrega, período da compra e UF. Quando os dois existem, o escolhido na barra lateral tem
-prioridade. A chave "Usar filtros de metadados" desliga os dois de uma vez: a busca passa a usar
-toda a base e os campos da barra lateral ficam bloqueados.
-
-Eles melhoram a recuperação de algumas formas:
-
-- Categoria: a busca fica restrita aos pedidos daquela categoria, em vez de depender de o
-  cliente ter escrito o nome do produto no comentário.
-- Sentimento: a busca por texto encontra avaliações sobre o mesmo assunto, mas não distingue
-  elogio de reclamação, porque um comentário positivo e um negativo sobre entrega usam palavras
-  parecidas. Filtrar pela nota separa os dois.
-- Situação da entrega: o atraso é calculado pela diferença entre a data de entrega e a data
-  prevista, então é possível olhar só para pedidos atrasados, mesmo os que não mencionam atraso no
-  texto.
-- Contexto do LLM: cada evidência já vem com nota, categoria e atraso, e o LLM pode usar essas
-  informações na resposta.
-
-O mesmo filtro é aplicado às duas buscas (no FAISS por `IDSelectorBatch` e no BM25 zerando o
-score de quem está fora do recorte), de modo que a fusão compara candidatos do mesmo conjunto.
-
-## 10. Avaliação
-
-Código: `src/avaliar.py`
-
-Os números abaixo vêm de `python src/avaliar.py --juiz`, que salva o resultado em
-`artefatos/avaliacao.json`. A mesma execução também gera a tabela de reescrita da seção 6.1.
-
-Nem todas as partes dependem do LLM:
-
-- Recuperação e a tabela da seção 6.1 não usam LLM. Com a mesma base e os mesmos modelos de
-  embeddings e reranking, os números se repetem em qualquer execução.
-- Recusas e fundamentação usam o LLM configurado no `.env`. Os resultados podem mudar se o
-  provedor (Gemini ou OpenAI) ou o modelo forem trocados, e variam um pouco entre execuções,
-  porque a geração de texto não é determinística (veja a seção 3 sobre a temperatura).
-
-Os números destas partes foram obtidos com `models/gemini-3.5-flash-lite` em outubro de 2026. O
-modelo usado em cada execução fica registrado no campo `llm` de `artefatos/avaliacao.json`. Ao
-trocar de modelo, rode a avaliação de novo para conferir os resultados.
-
-### Recuperação
-
-Precisão nos 10 primeiros resultados, por tema. Como não existe um gabarito anotado, uma
-avaliação foi considerada relevante quando o texto contém termos do tema (por expressão
-regular). Essa parte não usa o LLM.
-
-As colunas comparam quatro formas de buscar, da mais simples à usada no sistema:
-
-- Vetorial: só a busca por significado no FAISS (embeddings).
-- BM25: só a busca por palavras.
-- Híbrida (RRF): as duas buscas acima rodam juntas e as listas são combinadas por Reciprocal Rank
-  Fusion. Cada avaliação ganha pontos pela posição em que aparece em cada lista, então quem
-  aparece bem nas duas sobe no ranking.
-- Híbrida + reranker: a lista da híbrida é reordenada pelo cross-encoder, que lê a consulta e cada
-  avaliação juntas e dá um score de relevância. É a configuração usada pelo sistema.
-
-| Tema | Vetorial | BM25 | Híbrida (RRF) | Híbrida + reranker |
-|---|---|---|---|---|
-| Atraso na entrega | 0,90 | 0,80 | 1,00 | 1,00 |
-| Produto com defeito/quebrado | 1,00 | 0,60 | 1,00 | 1,00 |
-| Produto diferente do anunciado | 1,00 | 0,90 | 0,90 | 0,90 |
-| Pedido incompleto | 1,00 | 1,00 | 1,00 | 1,00 |
-| Atendimento e comunicação | 0,10 | 0,40 | 0,30 | 0,70 |
-| Devolução/reembolso | 1,00 | 0,90 | 1,00 | 1,00 |
-| Embalagem | 0,50 | 0,20 | 0,60 | 0,80 |
-| Elogio à rapidez da entrega | 1,00 | 0,40 | 0,80 | 1,00 |
-| Média | 0,81 | 0,65 | 0,82 | 0,93 |
-
-O reranker é o que mais contribui. A fusão ajuda nos temas em que uma das buscas vai mal sozinha,
-como "atendimento" e "embalagem", porque combina os resultados das duas.
-
-### Recusas
-
-Verifica se o sistema responde o que deve e recusa o que está fora do escopo ou não tem evidência.
-
-| Pergunta | Esperado | Resultado | Onde recusou |
-|---|---|---|---|
-| Quais são os principais problemas relatados pelos clientes? | responder | respondida | |
-| O que os clientes relatam sobre problemas relacionados à entrega? | responder | respondida | |
-| Quais aspectos da experiência de compra são mais elogiados? | responder | respondida | |
-| Quais padrões nas avaliações de clientes insatisfeitos? | responder | respondida | |
-| Padrões recorrentes relacionados à qualidade dos produtos? | responder | respondida | |
-| Qual é a capital da França? | recusar | fora do escopo | escopo |
-| Qual foi o faturamento da Olist em 2018? | recusar | fora do escopo | escopo |
-| Me passe uma receita de bolo de cenoura. | recusar | fora do escopo | escopo |
-| O que os clientes dizem sobre entregas feitas por drone? | recusar | evidência insuficiente | limiar |
-| Reclamações sobre pagamento com criptomoedas? | recusar | evidência insuficiente | limiar |
-| O que acham do programa de milhas aéreas da loja? | recusar | fora do escopo | escopo |
-
-As 11 perguntas tiveram o comportamento esperado. Também testamos o limiar sozinho, sem o LLM: as
-seis perguntas que deveriam ser recusadas continuam recusadas, mas duas perguntas válidas, por
-serem abstratas, também seriam. Isso mostra que a reescrita em subconsultas é necessária para
-encontrar as evidências, e que o limiar, isoladamente, já é uma proteção conservadora.
-
-### Fundamentação
-
-Um LLM-juiz confere se cada insight é sustentado pelas avaliações que ele cita. Dos 18 insights
-gerados nas cinco perguntas respondidas, 17 foram considerados totalmente sustentados, 1
-parcialmente sustentado (parte da afirmação não aparece nas avaliações citadas) e nenhum foi
-considerado sem sustentação. Em outra execução com o mesmo modelo, o resultado foi de 19
-sustentados e 3 parciais em 22 insights, o que mostra a variação entre execuções. O juiz é o mesmo LLM configurado no `.env` (Gemini ou OpenAI), ou
-seja, o modelo avalia as próprias respostas. Por isso esse número é um indicativo, não uma prova.
-
-## 11. Exemplos de perguntas e respostas
-
-Os exemplos completos, com resposta, insights, evidências e scores, estão em
-[docs/exemplos.md](docs/exemplos.md). Abaixo, um trecho (o texto do LLM varia um pouco entre
-execuções).
-
-Pergunta: *Quais são os principais problemas relatados pelos clientes?*
-
-Foi classificada como pergunta de panorama, com filtros de sentimento negativo e nota até 2
-(10.836 avaliações no recorte), gerou 5 subconsultas e usou 20 evidências.
-
-> Os principais problemas relatados envolvem falhas com o produto recebido (defeito, divergência
-> da foto e falta de peças), atrasos na entrega e problemas de atendimento.
-> - Produtos com defeito ou danificados [E1, E2, E3, E4]
-> - Atraso na entrega [E5, E6, E7, E8]
-> - Diferença entre o produto real e a foto/propaganda [E13, E14, E15, E16]
-> - Falta de peças ou itens na embalagem [E17, E18, E19, E20]
-> - Falta de resposta e suporte do vendedor ou site [E1, E9, E11, E12]
->
-> Limitações: as evidências permitem quantificar os problemas apenas nestas 20 avaliações de
-> notas 1 e 2, sem estimar a proporção desses problemas na base.
-
-| id | nota | categoria | entrega | rerank | texto |
-|---|---|---|---|---|---|
-| E2 | 2 | ferramentas jardim | no_prazo | +3,13 | O produto veio com defeito . Amassado. |
-| E5 | 1 | utilidades domesticas | atrasado | +5,86 | ATRASO ENORME NA ENTREGA. A entrega está muuuuito atrasada... |
-| E14 | 1 | cama mesa banho | no_prazo | +7,40 | Foto diferente do produto, qualidade ruim. |
-| E18 | 1 | utilidades domesticas | no_prazo | +3,85 | Veio faltando duas peças. |
-
-Pergunta fora do escopo: *Qual foi o faturamento da Olist em 2018?*
-O sistema responde que a pergunta pede dados financeiros da empresa, que não estão nas
-avaliações.
-
-Pergunta sem evidência: *O que os clientes dizem sobre as entregas feitas por drone?*
-A busca só encontra avaliações genéricas sobre entrega. O limiar do reranker, ou o próprio LLM
-("nenhuma delas cita ou faz referência a entregas feitas por drone"), impede uma resposta sem
-base.
-
-## 12. Decisões técnicas e desafios
-
-O desafio principal foi fazer perguntas abstratas, como "quais os principais problemas?",
-encontrarem avaliações relevantes. A solução foi a reescrita em subconsultas no vocabulário do
-cliente (seção 6.1). Ela trouxe outro problema: nas perguntas de panorama, um único tema podia
-ocupar todo o contexto. Por isso as posições do contexto são divididas igualmente entre as subconsultas, e o MMR garante
-variedade dentro de cada uma.
-
-Comentários genéricos que se repetem muito, como "Muito bom", são agrupados com um contador para
-não ocuparem várias posições.
-
-Para decidir quando não há evidência, usamos um limiar no score do reranker, calibrado com
-consultas dentro e fora do escopo, junto com o mínimo de 3 evidências. Essa checagem acontece
-antes de chamar o LLM, o que também economiza chamadas.
-
-Como o LLM pode citar evidências que não existem, a resposta é estruturada e as citações são
-validadas no código. Os comentários podem conter dados pessoais, que são mascarados na
-preparação, e também instruções escritas pelo cliente; por isso o texto vai delimitado por
-`<avaliacao>` e o prompt diz explicitamente que ele deve ser tratado como dado.
-
-No ambiente, as versões 2.6 ou mais novas do torch exigem um Visual C++ Redistributable recente no
-Windows, então fixamos o torch 2.5.1 (CPU). Como a máquina usada no desenvolvimento tem uma GPU de apenas 2 GB, os modelos de
-embeddings e de reranking escolhidos são pequenos e rodam em CPU, e a geração de texto é feita
-pela API do Gemini.
-
-## 13. Limitações e próximos passos
-
-- Frequência nas evidências não é o mesmo que frequência na base. O RAG recupera uma amostra
-  relevante, e "8 de 20 evidências" não representa a proporção real. Um próximo passo seria
-  classificar todas as avaliações por tema, de forma offline, e combinar essas contagens com o RAG.
-- A relevância usada na avaliação de recuperação é aproximada por expressões regulares. Um
-  gabarito anotado manualmente permitiria métricas mais confiáveis, como recall@k (quantas das avaliações
-  relevantes aparecem entre as k primeiras) e nDCG (que também considera a ordem em que aparecem).
-- O sentimento vem da nota, e há comentários ambíguos, como nota 5 com reclamação.
-- A categoria do pedido é a do item mais caro; cerca de 3% dos pedidos têm mais de um produto.
-- Outras melhorias possíveis: memória de conversa com LangGraph, cache de respostas, uma API com
-  FastAPI e avaliação com RAGAS.
+- O `delivery_status` usa a data final de entrega. Um cliente que avaliou antes do prazo vencer pode reclamar de atraso num pedido marcado como `no_prazo`.
+- Em 727 pedidos com produtos de categorias diferentes, o preparador usa a categoria do item mais caro.
+- O sistema não conta quantas vezes um tema aparece nos comentários. Os números da resposta vêm dos dados estruturados. Um próximo passo seria classificar todas as avaliações por tema, offline, e combinar essas contagens com o RAG.
+- A relevância da avaliação de recuperação é aproximada por expressões regulares. Um gabarito anotado à mão permitiria medir recall@k e nDCG.
+- O juiz é um LLM: os vereditos variam um pouco entre execuções, e o juiz da mesma família do gerador tende a favorecer as próprias respostas. Com `RERANKER=llm`, o rerank também varia.
+- O cross-encoder compara a frase de busca com a avaliação e não lê a pergunta original. Condições essenciais que não viram filtro ("entregas por drone") dependem da frase de busca preservá-las e do gerador recusar.
+- Nas regras de reserva, perguntas específicas usam a própria pergunta como frase de busca, e o cross-encoder costuma reprovar frases abstratas: sem LLM, "O que dizem sobre a embalagem?" é recusada, enquanto perguntas de panorama, que usam subtemas prontos, respondem com evidências.
+- As regras de reserva não verificam o escopo: sem LLM, "qual a capital da França?" segue para a busca e só as barreiras de similaridade e de rerank podem recusá-la.
+- O custo e o tempo de resposta dependem da API e do modelo escolhido para análise e geração. O rerank local roda na CPU; com `RERANKER=llm`, ele acrescenta uma chamada por frase de busca.
