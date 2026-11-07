@@ -46,8 +46,14 @@ def format_context(evidences: list[Evidence]) -> str:
 
 class AnswerGenerator:
     def __init__(self, llm):
-        prompt = ChatPromptTemplate.from_messages([("system", GENERATOR_SYSTEM), ("human", GENERATOR_HUMAN)])
-        self.chain = prompt | llm.with_structured_output(GeneratedAnswer)
+        self.chain = None
+        if llm is not None:
+            prompt = ChatPromptTemplate.from_messages([("system", GENERATOR_SYSTEM), ("human", GENERATOR_HUMAN)])
+            self.chain = prompt | llm.with_structured_output(GeneratedAnswer)
+
+    @property
+    def available(self) -> bool:
+        return self.chain is not None
 
     def generate(self, question: str, evidences: list[Evidence], overview: str) -> GeneratedAnswer:
         answer = self.chain.invoke({

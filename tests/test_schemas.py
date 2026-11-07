@@ -13,14 +13,18 @@ class ReviewFiltersTest(unittest.TestCase):
 
     def test_conditions_cover_every_field(self):
         result = filters(
-            min_score=4, max_score=5, delivery_status="atrasado", category="cama_mesa_banho",
+            min_score=4, max_score=4, delivery_status="atrasado", category="cama_mesa_banho",
             start_month="2017-11", end_month="2018-01", states=["sp", " rj "],
         ).conditions()
         self.assertEqual(result, [
-            ("score", ">=", 4), ("score", "<=", 5), ("delivery_status", "==", "atrasado"),
+            ("score", ">=", 4), ("score", "<=", 4), ("delivery_status", "==", "atrasado"),
             ("category", "==", "cama_mesa_banho"), ("purchase_month_num", ">=", 201711),
             ("purchase_month_num", "<=", 201801), ("state", "in", ["RJ", "SP"]),
         ])
+
+    def test_bounds_that_do_not_restrict_are_dropped(self):
+        self.assertEqual(filters(min_score=1, max_score=2).conditions(), [("score", "<=", 2)])
+        self.assertEqual(filters(min_score=4, max_score=5).conditions(), [("score", ">=", 4)])
 
     def test_invalid_values_are_ignored(self):
         result = filters(min_score=0, max_score=9, start_month="2017-13", end_month="nov", states=["XX", "Lua"])

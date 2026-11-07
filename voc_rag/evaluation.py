@@ -2,6 +2,7 @@ import json
 import re
 import statistics
 from collections import Counter
+from copy import copy
 from dataclasses import replace
 from datetime import date
 from typing import Literal
@@ -19,7 +20,7 @@ from voc_rag.llm import create_chat_model
 from voc_rag.pipeline import VoCPipeline
 from voc_rag.prompts import JUDGE_HUMAN, JUDGE_SYSTEM
 from voc_rag.query_analyzer import QueryAnalyzer
-from voc_rag.reranker import LLMReranker
+from voc_rag.reranker import create_reranker
 from voc_rag.retriever import ReviewRetriever
 from voc_rag.schemas import PipelineResult, QueryAnalysis, ReviewFilters, Status
 from voc_rag.stats import ReviewStats
@@ -102,7 +103,7 @@ class EvaluationRunner:
         self.store = create_vector_store(settings)
         check_index(self.store, settings)
         self.lexical = LexicalIndex(pd.read_parquet(settings.documents_path))
-        self.reranker = LLMReranker(create_chat_model(settings.llm_provider, settings.rerank_model, settings.temperature))
+        self.reranker = create_reranker(settings)
         self.analyzer = CachedAnalyzer(QueryAnalyzer(llm, self.stats.categories))
         self.generator = AnswerGenerator(llm)
         self.judge = None
@@ -111,10 +112,13 @@ class EvaluationRunner:
             prompt = ChatPromptTemplate.from_messages([("system", JUDGE_SYSTEM), ("human", JUDGE_HUMAN)])
             self.judge = prompt | judge_llm.with_structured_output(Verdicts)
 
-    def retriever(self, settings: Settings) -> ReviewRetriever:
-        return ReviewRetriever(
-            self.store, settings, self.lexical if settings.use_bm25 else None, self.reranker if settings.use_rerank else None
-        )
+    def retriever(self, settings: Settings, unfiltered: bool = False) -> ReviewRetriever:
+        reranker = self.reranker if settings.use_rerank else None
+        if reranker is not None and unfiltered:
+            # Ranking puro: o corte do reranker sai para medir só a ordenação.
+            reranker = copy(reranker)
+            reranker.min_score = float("-inf")
+        return ReviewRetriever(self.store, settings, self.lexical if settings.use_bm25 else None, reranker)
 
     def pipeline(self, config: dict) -> VoCPipeline:
         settings = replace(self.settings, **config)
@@ -126,8 +130,8 @@ class EvaluationRunner:
         for theme in themes:
             row = {"question": theme["question"]}
             for name, config in RETRIEVAL_CONFIGS.items():
-                settings = replace(self.settings, min_similarity=-1.0, min_relevance=0, **config)
-                pools, _ = self.retriever(settings).rank(theme["question"], [theme["question"]], ReviewFilters.empty())
+                settings = replace(self.settings, min_similarity=-1.0, **config)
+                pools, _ = self.retriever(settings, unfiltered=True).rank(theme["question"], [theme["question"]], ReviewFilters.empty())
                 row[name] = precision_at_k([candidate.text for candidate in pools[0]], theme["pattern"])
             rows.append(row)
             print(f"recuperação: {theme['question']}")
@@ -232,8 +236,9 @@ def to_markdown(report: dict) -> str:
         f"Repetições: {meta['repeat']}. Juiz: {meta['judge'] or 'não usado'}.", "",
         "| Item | Valor |", "|---|---|",
         f"| Modelo de chat | `{meta['llm']}` |", f"| Modelo do rerank | `{meta['rerank']}` |",
-        f"| Embeddings | `{meta['embeddings']}` |", f"| Similaridade mínima | {meta['min_similarity']} |",
-        f"| Nota mínima do rerank | {meta['min_relevance']} |", "",
+        f"| Embeddings | `{meta['embeddings']}` |", f"| Banco vetorial | `{meta.get('vector_store', 'chroma')}` |",
+        f"| Similaridade mínima | {meta['min_similarity']} |",
+        f"| Corte do rerank | {meta['min_relevance']} |", "",
     ]
     if meta.get("judge_warning"):
         lines += [f"> {meta['judge_warning']}", ""]
@@ -321,10 +326,11 @@ def run_evaluation(
     report = {
         "meta": {
             "date": date.today().isoformat(), "repeat": repeat, "split": split,
-            "llm": f"{settings.llm_provider}:{settings.chat_model}", "rerank": f"{settings.llm_provider}:{settings.rerank_model}",
+            "llm": f"{settings.llm_provider}:{settings.chat_model}", "rerank": runner.reranker.model and f"{runner.reranker.name}:{runner.reranker.model}",
             "judge": f"{settings.judge_provider}:{settings.judge_model}" if use_judge else None, "judge_warning": judge_warning,
             "embeddings": f"{settings.embedding_provider}:{settings.embedding_model}",
-            "min_similarity": settings.min_similarity, "min_relevance": settings.min_relevance,
+            "min_similarity": settings.min_similarity, "min_relevance": runner.reranker.min_score,
+            "vector_store": settings.vector_store,
         },
         "configs": configs,
         "questions": questions,

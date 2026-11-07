@@ -5,8 +5,10 @@ import pandas as pd
 
 from tests.fakes import TEST_SETTINGS
 from voc_rag.pipeline import VoCPipeline
-from voc_rag.prompts import ERROR_MESSAGE, INSUFFICIENT_MESSAGE, OUT_OF_SCOPE_MESSAGE
-from voc_rag.query_analyzer import QueryAnalyzer
+from voc_rag.prompts import (
+    ERROR_MESSAGE, GENERATION_UNAVAILABLE_MESSAGE, INSUFFICIENT_MESSAGE, OUT_OF_SCOPE_MESSAGE, RULES_NOTICE,
+)
+from voc_rag.query_analyzer import CategoryMatcher, QueryAnalyzer
 from voc_rag.retriever import Retrieval
 from voc_rag.schemas import Evidence, GeneratedAnswer, Insight, QueryAnalysis, ReviewFilters, Status
 from voc_rag.stats import ReviewStats
@@ -55,6 +57,8 @@ class FakeRetriever:
 
 
 class FakeGenerator:
+    available = True
+
     def __init__(self, result):
         self.result = result
 
@@ -161,6 +165,22 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("nota mínima", result.notices[0])
         self.assertIs(selected.analyzer.manual, manual)
 
+    def test_rules_analysis_adds_a_notice(self):
+        fallback = analysis()
+        fallback._source = "rules"
+        result = pipeline(fallback).ask("atrasos?")
+        self.assertEqual(result.status, Status.ANSWERED)
+        self.assertIn(RULES_NOTICE, result.notices)
+        self.assertEqual(result.trace["analysis_source"], "rules")
+
+    def test_without_llm_the_evidences_are_still_returned(self):
+        selected = pipeline(analysis())
+        selected.generator.available = False
+        result = selected.ask("atrasos?")
+        self.assertEqual((result.status, result.summary), (Status.ERROR, GENERATION_UNAVAILABLE_MESSAGE))
+        self.assertEqual(result.trace["stopped_at"], "no_llm")
+        self.assertEqual(len(result.evidences), 3)
+
     def test_filters_can_be_disabled(self):
         retriever = FakeRetriever(evidences(3))
         pipeline(analysis(max_score=2), retriever).ask("problemas?", use_filters=False)
@@ -176,16 +196,34 @@ class StubChain:
         return self.output
 
 
+class FailingChain:
+    def invoke(self, inputs):
+        raise TimeoutError("sem resposta")
+
+
 class QueryAnalyzerTest(unittest.TestCase):
     def analyzer(self, output) -> QueryAnalyzer:
         analyzer = QueryAnalyzer.__new__(QueryAnalyzer)
-        analyzer.categories = {"bebes"}
+        analyzer.categories = CategoryMatcher(["bebes", "cama_mesa_banho"])
         analyzer.chain = StubChain(output)
         return analyzer
 
     def test_unknown_category_is_dropped(self):
         result = self.analyzer(analysis(category="bed_bath")).analyze("p")
         self.assertIsNone(result.filters.category)
+
+    def test_misspelled_category_is_matched(self):
+        result = self.analyzer(analysis(category="cama, mesa e banho")).analyze("p")
+        self.assertEqual(result.filters.category, "cama_mesa_banho")
+
+    def test_llm_failure_falls_back_to_rules(self):
+        analyzer = self.analyzer(None)
+        analyzer.chain = FailingChain()
+        with self.assertLogs("voc_rag.query_analyzer", "WARNING"):
+            result = analyzer.analyze("Quais os principais problemas dos clientes insatisfeitos?")
+        self.assertEqual(result.source, "rules")
+        self.assertEqual(result.filters.conditions(), [("score", "<=", 2)])
+        self.assertEqual(result.question_type, "overview")
 
     def test_queries_are_cleaned_and_limited(self):
         result = self.analyzer(analysis(queries=[" a ", "a", "", "b", "c", "d", "e", "f", "g"])).analyze("p")

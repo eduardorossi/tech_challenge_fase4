@@ -4,10 +4,10 @@ from dataclasses import replace
 import numpy as np
 
 from tests.fakes import TEST_SETTINGS, FakeLexical, FakeReranker, FakeVectorStore, record
-from voc_rag.retriever import (
-    ReviewRetriever, maximal_marginal_relevance, reciprocal_rank_fusion, to_chroma_filter,
-)
+from voc_rag.reranker import CrossEncoderReranker
+from voc_rag.retriever import ReviewRetriever, maximal_marginal_relevance, reciprocal_rank_fusion
 from voc_rag.schemas import ReviewFilters
+from voc_rag.vector_store import to_chroma_filter
 
 LATE = [1.0, 0.0, 0.0]
 BROKEN = [0.0, 1.0, 0.0]
@@ -89,7 +89,26 @@ class RetrieverTest(unittest.TestCase):
     def test_filters_reach_the_vector_store(self):
         selected = retriever()
         selected.retrieve("q", ["atraso"], ReviewFilters.empty().model_copy(update={"max_score": 2}), top_k=4)
-        self.assertEqual(selected.vector_store.filters, [{"score": {"$lte": 2}}])
+        self.assertEqual([filters.conditions() for filters in selected.vector_store.filters], [[("score", "<=", 2)]])
+
+    def test_cross_encoder_logits_gate_and_order_the_pool(self):
+        logits = {"Chegou com atraso de uma semana": 4.0, "Não recebi o produto": 1.5}
+        encoder = FakeEncoder(lambda query, text: logits.get(text, -3.0))
+        reranker = CrossEncoderReranker("fake", min_score=0.0, encoder=encoder)
+        result = retriever(reranker=reranker).retrieve("atrasos?", ["atraso"], ReviewFilters.empty(), top_k=4)
+        self.assertEqual([evidence.text for evidence in result.evidences], ["Chegou com atraso de uma semana", "Não recebi o produto"])
+        self.assertEqual(result.evidences[0].relevance, 4.0)
+        self.assertEqual(result.trace[0]["relevant"], 2)
+
+
+class FakeEncoder:
+    def __init__(self, scorer):
+        self.scorer = scorer
+        self.pairs = []
+
+    def predict(self, pairs, show_progress_bar=False):
+        self.pairs += pairs
+        return np.array([self.scorer(query, text) for query, text in pairs])
 
 
 if __name__ == "__main__":

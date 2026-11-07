@@ -3,7 +3,7 @@ import json
 import logging
 
 from voc_rag.config import ROOT, Settings
-from voc_rag.indexing import ReviewIndexer
+from voc_rag.indexing import ReviewIndexer, index_name
 from voc_rag.pipeline import build_pipeline
 from voc_rag.preparation import ReviewDataPreparer
 
@@ -20,7 +20,8 @@ def run_examples(settings: Settings) -> None:
         "# Exemplos de perguntas e respostas", "",
         f"Modelo de chat: `{settings.llm_provider}:{settings.chat_model}`. "
         f"Embeddings: `{settings.embedding_provider}:{settings.embedding_model}`. "
-        f"Multi-query: {settings.use_multi_query}. BM25: {settings.use_bm25}. Rerank: {settings.use_rerank}.", "",
+        f"Banco vetorial: `{settings.vector_store}`. Multi-query: {settings.use_multi_query}. BM25: {settings.use_bm25}. "
+        f"Rerank: {settings.reranker if settings.use_rerank else False}.", "",
     ]
     for example in examples:
         result = pipeline.ask(example["question"])
@@ -58,7 +59,7 @@ def main() -> None:
     if args.command == "prepare":
         print(ReviewDataPreparer(settings).run())
     elif args.command == "index":
-        print(f"{ReviewIndexer(settings).build()} documentos no índice {settings.collection_name}")
+        print(f"{ReviewIndexer(settings).build()} documentos no índice {index_name(settings)}")
     elif args.command == "ask":
         print(build_pipeline(settings).ask(args.question).to_markdown())
     elif args.command == "examples":

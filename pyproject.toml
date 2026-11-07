@@ -8,8 +8,8 @@ version = "1.0.0"
 description = "Voice of Customer Intelligence: RAG sobre avaliações de clientes da Olist"
 readme = "README.md"
 requires-python = ">=3.12"
-# As dependências ficam em requirements.txt (o PyTorch é instalado à parte, pelo índice CPU)
+# As dependências ficam em requirements.txt (o PyTorch CPU vem do índice extra declarado lá)
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 include = ["voc_rag*"]

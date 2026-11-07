@@ -1,5 +1,4 @@
 import numpy as np
-from langchain_core.documents import Document
 
 from voc_rag.config import Settings
 from voc_rag.schemas import ReviewFilters
@@ -16,28 +15,28 @@ class FakeEmbeddings:
 
 
 class FakeVectorStore:
-    # Imita a parte da API do langchain_chroma.Chroma usada pelo retriever.
+    # Imita a interface de FaissReviewStore e ChromaReviewStore usada pelo retriever.
     def __init__(self, records: list[dict], query_vectors: dict[str, list[float]]):
         self.records = {record["id"]: record for record in records}
         self.embeddings = FakeEmbeddings(query_vectors)
         self.filters = []
 
-    def similarity_search_by_vector_with_relevance_scores(self, embedding, k, filter=None):
-        self.filters.append(filter)
-        query = np.array(embedding)
+    def count(self) -> int:
+        return len(self.records)
+
+    def search(self, query_vector, k, filters: ReviewFilters) -> list[str]:
+        self.filters.append(filters)
+        query = np.array(query_vector)
         scored = []
         for record in self.records.values():
             vector = np.array(record["vector"]) / np.linalg.norm(record["vector"])
-            scored.append((Document(id=record["id"], page_content=record["text"], metadata=record["metadata"]), 1 - float(vector @ query)))
-        return sorted(scored, key=lambda pair: pair[1])[:k]
+            scored.append((record["id"], float(vector @ query)))
+        return [doc_id for doc_id, _ in sorted(scored, key=lambda pair: -pair[1])[:k]]
 
-    def get(self, ids=None, include=None):
-        records = [self.records[doc_id] for doc_id in ids if doc_id in self.records]
+    def fetch(self, ids):
         return {
-            "ids": [record["id"] for record in records],
-            "documents": [record["text"] for record in records],
-            "metadatas": [record["metadata"] for record in records],
-            "embeddings": [record["vector"] for record in records],
+            doc_id: (self.records[doc_id]["text"], self.records[doc_id]["metadata"], self.records[doc_id]["vector"])
+            for doc_id in ids if doc_id in self.records
         }
 
 
@@ -50,9 +49,18 @@ class FakeLexical:
 
 
 class FakeReranker:
+    # Mesma escala do LLMReranker: notas de 0 a 3 e corte em 2.
+    name = "fake"
+    model = "fake"
+    min_score = 2
+
     def __init__(self, grades: dict[str, int]):
         self.grades = grades
         self.calls = []
+
+    @staticmethod
+    def score(relevance, similarity):
+        return (relevance + similarity) / 4
 
     def grade(self, question, filters, queries, texts):
         self.calls.append((question, filters, queries))

@@ -15,16 +15,18 @@ flowchart TD
         B --> C[reviews_analytics.parquet]
         B --> D[reviews_documents.parquet]
         D --> E[ReviewIndexer]
-        E --> F[(Chroma com embeddings via API)]
+        E --> F[(FAISS exato com embeddings E5 locais)]
     end
     subgraph online["Consulta"]
         Q[Pergunta e recorte opcional] --> QA[QueryAnalyzer]
         QA -->|fora do escopo| X1[Recusa]
+        QA -.->|LLM indisponível| RU[Regras de fallback]
+        RU -.-> RT
         QA -->|frases de busca e filtros| RT[ReviewRetriever]
         F --> RT
         D --> BM[LexicalIndex BM25]
         BM --> RT
-        RT <-->|notas de 0 a 3| RR[LLMReranker]
+        RT <-->|logit de relevância| RR[CrossEncoderReranker]
         QA -->|filtros| ST[ReviewStats]
         C --> ST
         RT -->|menos de 3 evidências| X2[Evidência insuficiente]
@@ -38,12 +40,15 @@ flowchart TD
 | Componente | Arquivo | Responsabilidade |
 |---|---|---|
 | `Settings` | `voc_rag/config.py` | Guarda caminhos, provedores, modelos e parâmetros de busca |
-| Provedores | `voc_rag/llm.py` | Cria os modelos de chat e os embeddings da OpenAI ou do Gemini |
+| Provedores | `voc_rag/llm.py` | Cria os modelos de chat (OpenAI ou Gemini) e os embeddings: E5 local (`E5Embeddings`, com os prefixos `query:`/`passage:`), OpenAI ou Gemini |
 | `ReviewDataPreparer` | `voc_rag/preparation.py` | Lê os CSVs, limpa os textos, junta metadados e grava os parquets |
-| `ReviewIndexer` | `voc_rag/indexing.py` | Gera os embeddings e cria a coleção do modelo no Chroma |
-| `QueryAnalyzer` | `voc_rag/query_analyzer.py` | Checa o escopo, classifica a pergunta, escreve as frases de busca e extrai filtros |
+| `ReviewIndexer` | `voc_rag/indexing.py` | Gera os embeddings e cria o índice do modelo no FAISS (padrão) ou no Chroma |
+| `FaissReviewStore` | `voc_rag/vector_store.py` | Busca exata no FAISS com pré-filtro de metadados (`IDSelectorBatch`) e devolve os vetores do próprio índice (`reconstruct`) |
+| `ChromaReviewStore` | `voc_rag/vector_store.py` | Mesma interface sobre o Chroma, para quem prefere embeddings por API |
+| `QueryAnalyzer` | `voc_rag/query_analyzer.py` | Checa o escopo, classifica a pergunta, escreve as frases de busca e extrai filtros; cai nas regras (`rules_analysis`) quando o LLM falha e aproxima a categoria por `difflib` (`CategoryMatcher`) |
 | `LexicalIndex` | `voc_rag/lexical.py` | Busca por palavras com BM25, respeitando os filtros |
-| `LLMReranker` | `voc_rag/reranker.py` | Dá a cada candidato uma nota de relevância de 0 a 3 |
+| `CrossEncoderReranker` | `voc_rag/reranker.py` | Padrão: cross-encoder multilíngue local que dá um logit de relevância a cada par (frase de busca, avaliação) |
+| `LLMReranker` | `voc_rag/reranker.py` | Alternativa (`RERANKER=llm`): o LLM dá a cada candidato uma nota de relevância de 0 a 3 |
 | `ReviewRetriever` | `voc_rag/retriever.py` | Junta busca densa e BM25, aplica corte e rerank, divide as vagas entre as frases e agrupa repetidos |
 | `ReviewStats` | `voc_rag/stats.py` | Calcula os números do recorte sobre a base completa |
 | `AnswerGenerator` | `voc_rag/generator.py` | Monta o contexto, gera a resposta estruturada e valida as citações |
@@ -58,8 +63,9 @@ flowchart TD
 
 - Python 3.11 ou superior
 - LangChain (`langchain`, `langchain-core`, `langchain-openai`, `langchain-google-genai` e `langchain-chroma`), com `init_chat_model` para trocar de provedor pelo `.env`
-- OpenAI ou Google Gemini, sempre por API: chat, rerank, juiz da avaliação e embeddings. Não há modelo local, então a instalação não precisa de PyTorch nem de GPU
-- Chroma como banco vetorial local
+- OpenAI ou Google Gemini por API para análise da pergunta, geração e juiz da avaliação (e, opcionalmente, embeddings e rerank)
+- `sentence-transformers` com PyTorch CPU para os modelos locais: embeddings `intfloat/multilingual-e5-small` e reranker `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`. Não precisam de GPU
+- FAISS (`faiss-cpu`) como banco vetorial padrão; Chroma como alternativa (`VECTOR_STORE=chroma`)
 - `rank-bm25` para a busca lexical, em memória
 - pandas e pyarrow para preparação e estatísticas
 - Streamlit para a interface
@@ -121,18 +127,20 @@ A base analítica `reviews_analytics.parquet` guarda as 98.410 avaliações úni
 
 ### Embeddings e indexação
 
-O modelo padrão é o `text-embedding-3-small` da OpenAI, que tem bom desempenho em português e custa US$ 0,02 por milhão de tokens. Os 39.192 documentos somam cerca de 2,9 milhões de caracteres, e a indexação completa sai por alguns centavos de dólar. Com `EMBEDDING_PROVIDER=google`, o projeto usa o `gemini-embedding-2-preview`.
+O modelo padrão é o `intfloat/multilingual-e5-small`, que roda local em CPU. Ele foi treinado para busca assimétrica (pergunta curta contra passagem) e exige prefixos: a frase de busca entra como `query: ...` e cada avaliação como `passage: ...`. A classe `E5Embeddings` aplica os prefixos e normaliza os vetores. Indexar não custa nada, funciona offline e é reproduzível: o mesmo texto sempre gera o mesmo vetor. Com `EMBEDDING_PROVIDER=openai` ou `google`, o projeto usa o `text-embedding-3-small` ou o `gemini-embedding-2-preview` por API.
 
-O Chroma roda local, grava em `data/chroma` e filtra por metadados. Com 39 mil documentos, um servidor vetorial dedicado só acrescentaria infraestrutura. Cada modelo de embeddings tem sua própria coleção, e a coleção usa distância de cosseno explícita, porque nem todo provedor devolve vetores com norma 1. O indexador envia lotes de 1.000 documentos e recria só a coleção do modelo atual. Ao montar o pipeline, o código confere se a coleção tem o mesmo número de documentos que o parquet.
+O banco vetorial padrão é o FAISS, com um índice exato (`IndexFlatIP` sobre vetores normalizados, ou seja, cosseno). Com 39 mil vetores de 384 dimensões, a busca exata leva poucos milissegundos e dispensa índice aproximado. O filtro de metadados vira uma máscara do pandas, e o `IDSelectorBatch` faz o FAISS comparar a consulta só com as avaliações do recorte: o filtro entra **antes** da busca, então um recorte pequeno, como "Roraima com nota até 2", recebe as mesmas 40 candidatas que a base inteira receberia. Filtrar depois de uma busca global perderia quase todas. O índice e a lista de IDs ficam em `data/faiss/`, um arquivo por modelo de embeddings; ao carregar, o código confere se a lista de IDs é a mesma do parquet de documentos.
 
-O Chroma local não oferece busca híbrida: a API de busca com BM25 e RRF só existe no Chroma Cloud. Por isso o BM25 roda em memória, sobre o parquet de documentos, e leva poucos segundos para ser montado quando a aplicação inicia.
+Os vetores dos candidatos saem do próprio índice (`reconstruct`), e o MMR usa esses vetores sem recalcular embeddings.
+
+Com `VECTOR_STORE=chroma`, o projeto usa o Chroma local em `data/chroma`, com uma coleção por modelo e distância de cosseno explícita. O BM25 roda em memória, sobre o parquet de documentos, nos dois casos.
 
 ## Pipeline RAG
 
-1. **Transformação da pergunta.** O `QueryAnalyzer` faz uma chamada ao LLM com saída estruturada no esquema `QueryAnalysis`. O modelo informa se a pergunta está no escopo, se ela pede um panorama ("quais os principais problemas?") ou trata de um assunto específico, escreve as frases de busca e preenche os filtros. As frases são escritas como um cliente escreveria na avaliação: de 4 a 6 em perguntas de panorama, uma por subtema provável, e 1 ou 2 em perguntas específicas. Uma pergunta abstrata sobre "problemas" fica longe, no espaço vetorial, de uma avaliação que diz "o produto não chegou"; as frases concretas encurtam essa distância. O código descarta categorias que não existem na base.
-2. **Busca híbrida.** Para cada frase, o `ReviewRetriever` pede ao Chroma os 40 documentos mais próximos e ao BM25 os 40 de maior pontuação, os dois com os mesmos filtros. O BM25 encontra termos exatos, como "correios" ou "nota fiscal". A tokenização do BM25 tira acentos e stopwords e corta as palavras em 5 letras, mas mantém o "não". As duas listas são fundidas por Reciprocal Rank Fusion (RRF, k=60), que combina posições e dispensa normalizar os scores.
-3. **Corte de similaridade.** O retriever lê os embeddings dos candidatos no Chroma e calcula o cosseno com a frase de busca, inclusive para os que vieram só do BM25. Candidatos abaixo de 0,40 saem.
-4. **Rerank.** Até 30 candidatos por frase vão a um LLM, que lê a pergunta original, o filtro aplicado, a frase de busca e cada avaliação e dá uma nota de 0 a 3. As chamadas rodam em paralelo. Só ficam as avaliações com nota 2 ou 3. O rerank recebe a pergunta original para cobrar as condições essenciais: uma avaliação sobre entrega comum recebe nota baixa numa pergunta sobre entregas por drone.
+1. **Transformação da pergunta.** O `QueryAnalyzer` faz uma chamada ao LLM com saída estruturada no esquema `QueryAnalysis`. O modelo informa se a pergunta está no escopo, se ela pede um panorama ("quais os principais problemas?") ou trata de um assunto específico, escreve as frases de busca e preenche os filtros. As frases são escritas como um cliente escreveria na avaliação: de 4 a 6 em perguntas de panorama, uma por subtema provável, e 1 ou 2 em perguntas específicas. Uma pergunta abstrata sobre "problemas" fica longe, no espaço vetorial, de uma avaliação que diz "o produto não chegou"; as frases concretas encurtam essa distância. O código aproxima a categoria escrita pelo modelo da grafia da base com `difflib` ("cama, mesa e banho" vira `cama_mesa_banho`) e descarta o que não se parece com nenhuma categoria. Se o LLM falhar (sem chave, sem cota, timeout), a análise cai em regras determinísticas: palavras como "insatisfeitos" e "elogios" definem a faixa de nota e os subtemas ("reclamações" muda só os subtemas), "principais" e "padrões" marcam a pergunta como panorama, e mês, ano, estado, categoria e situação de entrega são lidos por expressões regulares. A resposta avisa que o escopo não foi verificado.
+2. **Busca híbrida.** Para cada frase, o `ReviewRetriever` pede ao FAISS os 40 documentos mais próximos e ao BM25 os 40 de maior pontuação, os dois com os mesmos filtros. O BM25 encontra termos exatos, como "correios" ou "nota fiscal". A tokenização do BM25 tira acentos e stopwords e corta as palavras em 5 letras, mas mantém o "não". As duas listas são fundidas por Reciprocal Rank Fusion (RRF, k=60), que combina posições e dispensa normalizar os scores.
+3. **Corte de similaridade.** O retriever lê os vetores dos candidatos no índice e calcula o cosseno com a frase de busca, inclusive para os que vieram só do BM25. O corte depende do modelo: o E5 concentra as similaridades numa faixa alta, e o padrão é 0,80; com os modelos por API, 0,40.
+4. **Rerank.** Até 30 candidatos por frase vão ao cross-encoder `mmarco-mMiniLMv2-L12-H384-v1`, treinado no mMARCO (que inclui português). Ele lê a frase de busca e a avaliação juntas e devolve um logit de relevância; só ficam as avaliações com logit acima de `MIN_RERANK_SCORE` (−1 por padrão, calibrado no split `dev`: com 0, recortes estreitos como as 35 avaliações do Acre eram recusados). Todos os pares de todas as frases vão num único lote. O rerank é determinístico, não custa nada por consulta e o score contínuo permite calibrar o corte. Com `RERANKER=llm`, o LLM lê a pergunta original, o filtro, a frase de busca e cada avaliação e dá uma nota de 0 a 3; só ficam as notas 2 e 3.
 5. **Seleção.** As vagas do contexto (12 em perguntas específicas, 20 em panorama) são divididas igualmente entre as frases com resultado, para que todos os subtemas apareçam; com 6 frases, a divisão fica em 4, 4, 3, 3, 3 e 3. Dentro da vaga de cada frase, o MMR (Maximal Marginal Relevance, λ=0,7) escolhe avaliações relevantes e diferentes entre si, o que evita quatro versões de "chegou atrasado". Várias avaliações "Não recebi o produto" viram uma evidência com contador de repetições.
 6. **Panorama.** O `ReviewStats` aplica os mesmos filtros na base analítica completa e calcula total de avaliações, percentual com comentário, distribuição de notas, situação de entrega e, sem filtro de estado, os estados com mais avaliações.
 7. **Construção do contexto.** Cada evidência entra no prompt com ID `R1`, `R2` e assim por diante, seguida dos metadados do pedido (nota, categoria, entrega, mês e estado), da frase de busca que a encontrou e do texto do cliente, em blocos separados.
@@ -170,11 +178,11 @@ Com o recorte vazio, a resposta informa o filtro aplicado e o período coberto p
 
 Os prompts tratam a pergunta e o texto das avaliações como dados. Pedidos para inventar avaliações, ignorar regras ou assumir outro papel não são obedecidos, e a avaliação inclui um caso desses.
 
-O corte de cosseno de 0,40 funciona como pré-filtro barato, não como barreira. Na avaliação, as perguntas sem base tiveram similaridade máxima entre 0,58 e 0,73, na mesma faixa das que têm resposta, e só o rerank separou os dois grupos (nota máxima 1 contra 3). O split `dev` da avaliação registra a maior similaridade e a maior nota do rerank de cada pergunta; use-o para recalibrar quando trocar o modelo de embeddings.
+O corte de cosseno funciona como pré-filtro barato, não como barreira. Com o E5, frases sem base na Olist (drone, criptomoedas, Lua, milhas, videochamada, cashback, capital da França, receita de bolo) tiveram similaridade máxima entre 0,83 e 0,90, na mesma faixa das frases com resposta (0,89 a 0,96). Quem separa os grupos é o cross-encoder: entre os 40 vizinhos de cada frase sem base, no máximo 1 passou do logit 0, o que fica abaixo do mínimo de 3 evidências; frases com resposta tiveram de 10 a 34 aprovadas. Na execução anterior, com `text-embedding-3-small` e rerank por LLM, o padrão foi o mesmo: similaridade entre 0,58 e 0,73 nas perguntas sem base e nota máxima 1 no rerank, contra 3 nas que têm resposta. O split `dev` da avaliação registra a maior similaridade e a maior nota do rerank de cada pergunta; use-o para recalibrar quando trocar o modelo de embeddings.
 
 ## Metadados e exploração contextual
 
-O Chroma e o BM25 aplicam os filtros antes de ordenar. Numa busca por "problemas nas avaliações com nota baixa" sem filtro, elogios com as mesmas palavras aparecem entre os resultados. Com `score <= 2`, a busca considera só avaliações negativas.
+O FAISS (pelo `IDSelectorBatch`) e o BM25 aplicam os filtros antes de ordenar. Numa busca por "problemas nas avaliações com nota baixa" sem filtro, elogios com as mesmas palavras aparecem entre os resultados. Com `score <= 2`, a busca considera só avaliações negativas.
 
 Os filtros vêm de duas fontes. O analisador extrai os da pergunta: nota, situação de entrega, categoria, período e estado do cliente. A barra lateral permite escolher um recorte manual, que tem prioridade. Quando o recorte manual troca um filtro identificado na pergunta, a resposta traz um aviso, porque o filtro pode ser a causa de uma resposta inesperada. A chave "Usar filtros de metadados" desliga os dois de uma vez.
 
@@ -199,7 +207,7 @@ O comando `python -m voc_rag.cli evaluate --judge` mede o pipeline e grava o rel
 ### O que é medido
 
 - **Recuperação, precisão@10.** Para 8 temas (atraso, defeito, produto diferente, pedido incompleto, atendimento, devolução, embalagem e rapidez), o comando ordena as avaliações com a própria pergunta e conta quantas das 10 primeiras casam com a expressão regular do tema. Não existe gabarito anotado, então o rótulo é aproximado; ele serve para comparar as estratégias entre si. Quatro estratégias: só densa, híbrida, densa com rerank e híbrida com rerank.
-- **Respostas e recusas.** São 23 perguntas: 11 que a base responde e 12 que devem ser recusadas, entre fora do escopo, sem evidência, com condição essencial impossível (Lua, drone, videochamada), período fora da base e tentativa de injeção de prompt. Elas estão divididas em dois grupos. O split `dev` (8 perguntas) serve para calibrar parâmetros, como `MIN_SIMILARITY`. O split `test` (15 perguntas) serve para relatar o resultado, sem ajuste. O relatório mostra a acurácia, as recusas indevidas, as respostas indevidas, os erros e a barreira que recusou cada pergunta.
+- **Respostas e recusas.** São 31 perguntas: 16 que a base responde e 15 que devem ser recusadas, entre fora do escopo, sem evidência, com condição essencial impossível (Lua, drone, videochamada, loja em Paris, atendimento em Libras, provador virtual), período fora da base e tentativa de injeção de prompt. Oito delas foram acrescentadas para a avaliação deixar de saturar: recortes estreitos (8 avaliações de Roraima com nota até 2, 35 do Acre), combinações de categoria com período ou situação de entrega e reclamações que não implicam nota. Elas estão divididas em dois grupos. O split `dev` (11 perguntas) serve para calibrar parâmetros, como `MIN_SIMILARITY`. O split `test` (20 perguntas) serve para relatar o resultado, sem ajuste. O relatório mostra a acurácia, as recusas indevidas, as respostas indevidas, os erros e a barreira que recusou cada pergunta.
 - **Ablação.** As perguntas rodam em quatro configurações: `baseline` (uma frase de busca, busca densa e corte de similaridade), `multi_query`, `hybrid` (com BM25) e `full` (com rerank). Todas recebem a mesma análise da pergunta em cada repetição, para isolar o efeito da recuperação.
 - **Extração de filtros.** Compara as condições extraídas com `expected_filters` nas perguntas que têm filtros esperados.
 - **Fundamentação.** Um LLM-juiz confere cada insight contra as avaliações que ele cita (sustentado, parcial ou não sustentado) e marca quando o insight atribui ao cliente algo que só está nos metadados do pedido. O relatório também conta os insights descartados pela validação de citações.
@@ -260,33 +268,66 @@ Nenhum insight foi julgado sem sustentação, e a validação de citações não
 
 **Limites da avaliação:** 22 perguntas e uma repetição medem a direção dos efeitos, não a variação entre execuções; use `--repeat 3` para obter média e desvio. A relevância da recuperação usa expressões regulares, e o juiz é da mesma família do gerador.
 
+### Recuperação com os modelos locais
+
+Medição feita em 7 de novembro de 2026 sobre a base completa (39.192 documentos), sem LLM, com o script de ranking de `evaluate_retrieval`: a própria pergunta como frase de busca, sem corte de similaridade e sem o corte do reranker.
+
+| Item | Valor |
+|---|---|
+| Indexação (E5 small, CPU) | 10 min 18 s, uma vez; índice FAISS de 57 MB |
+| Carga do pipeline | 13 s (modelos, índice e BM25) |
+| Busca densa por frase | 43 ms |
+| Rerank de 30 candidatos por frase | cerca de 0,9 s na CPU |
+| Pergunta de panorama (6 frases: densa, BM25, rerank e MMR) | 4,6 s, 0 tokens |
+
+| Configuração | Precisão@10 (E5 + FAISS + cross-encoder) | Precisão@10 na execução anterior (OpenAI + rerank por LLM) |
+|---|---|---|
+| `dense` | 0,84 | 0,89 |
+| `hybrid` | 0,81 | 0,85 |
+| `dense_rerank` | 0,91 | 0,90 |
+| `hybrid_rerank` | 0,91 | 0,97 |
+
+O cross-encoder eleva a precisão de 0,84 para 0,91, sem tokens. O rerank por LLM chegou a 0,97, mas custava cerca de 2.300 tokens de entrada e 2.300 de saída e 8 segundos a mais por pergunta. Os temas mais fracos com o cross-encoder são os abstratos ("Como os clientes avaliam o atendimento?", 0,60): o modelo foi treinado com perguntas concretas e funciona melhor com as frases no estilo do cliente que o analisador escreve.
+
+Pré-filtro do FAISS contra a alternativa de filtrar depois de uma busca global, para a frase "o produto chegou atrasado":
+
+| Recorte | Avaliações no recorte | Candidatas com pré-filtro | Pós-filtro sobre os 40 mais próximos | Pós-filtro sobre os 400 mais próximos |
+|---|---|---|---|---|
+| Estado AC | 35 | 35 | 1 | 2 |
+| Estado RR e nota até 2 | 8 | 8 | 0 | 0 |
+| Categoria `bebes` e nota até 2 | 317 | 40 | 0 | 7 |
+| Não entregues em 2018-08 | 95 | 40 | 0 | 2 |
+
+Os números de respostas, recusas e fundamentação acima vêm da execução anterior, com OpenAI. A execução de 7 de novembro de 2026 com os modelos locais e `gemini-3.5-flash-lite` no chat e no juiz, sobre as 31 perguntas, está em [docs/avaliacao.md](docs/avaliacao.md). `baseline`, `multi_query` e `hybrid` acertaram todas; a `full` ficou com acurácia 0,91 em dev e 0,95 em test, porque o corte do cross-encoder recusou os dois recortes estreitos (Acre e Roraima com nota até 2), que ficaram com 2 evidências cada, abaixo do mínimo de 3. Em troca, a `full` teve a melhor fundamentação (50 de 53 insights sustentados, contra 51 de 58 na `hybrid`), recusou no rerank perguntas sem base antes do gerador e gastou 1.258 tokens de entrada e 201 de saída e 3,2 s por pergunta. Os 13 filtros esperados foram extraídos corretamente. Nenhuma configuração respondeu a uma pergunta que deveria recusar. Como o modelo de chat mudou, a comparação com a execução anterior mistura o efeito do rerank local com o do modelo.
+
 ## Principais decisões técnicas
 
 | Decisão | Alternativa descartada | Motivo |
 |---|---|---|
-| Chroma local | Qdrant ou pgvector em servidor | 39 mil documentos cabem em disco local |
+| FAISS exato (`IndexFlatIP`) com pré-filtro por `IDSelectorBatch` | Chroma (HNSW aproximado) ou Qdrant/pgvector em servidor | 39 mil vetores cabem em memória, a busca exata leva milissegundos e o filtro entra antes da busca, sem perder candidatas em recortes pequenos; o Chroma continua disponível com `VECTOR_STORE=chroma` |
 | Um documento por avaliação | Chunking | O comentário mais longo tem 208 caracteres |
 | `review_id` como ID do documento | Posição da linha no parquet | O ID não muda quando a base é reconstruída |
-| Modelos só por API (OpenAI ou Gemini) | Embeddings e cross-encoder locais | Sem PyTorch, a instalação fica leve e roda em qualquer máquina; o custo por pergunta fica em centavos |
+| Embeddings E5 e cross-encoder locais; LLM por API só para análise e geração | Todos os modelos por API | Indexar e reranquear não custam nada, funcionam offline e são reproduzíveis; o preço é instalar o PyTorch CPU |
 | Uma chamada de LLM para escopo, tipo, frases de busca e filtros | Chamadas separadas | Menos latência e custo |
+| Categoria aproximada por `difflib` | Descartar a categoria com grafia diferente | O LLM escreve "cama, mesa e banho" e a base guarda `cama_mesa_banho`; sem a aproximação, o filtro sumiria |
 | Várias frases de busca em perguntas de panorama | Uma frase só | Cada subtema ganha sua busca e suas vagas no contexto |
 | Busca híbrida, densa e BM25, com RRF | Só busca densa | O BM25 acha termos exatos que a busca densa perde |
-| BM25 em memória | Busca híbrida do Chroma | A busca híbrida do Chroma só existe no Chroma Cloud |
-| Rerank por LLM com nota de 0 a 3 | Cross-encoder local ou serviço de rerank dedicado | Mantém só os provedores do projeto e cobra as condições essenciais da pergunta |
-| Corte de cosseno antes do rerank | Rerank de todos os candidatos | Descarta candidatos distantes sem gastar tokens |
+| BM25 em memória | Busca híbrida do banco vetorial | Nem o FAISS nem o Chroma local oferecem BM25; em memória, ele usa a mesma máscara de filtros do FAISS |
+| Cross-encoder local (`mmarco-mMiniLMv2`) como rerank padrão | Rerank por LLM com nota de 0 a 3 | Determinístico, sem custo e com score contínuo, que permite calibrar o corte; o rerank por LLM continua disponível com `RERANKER=llm`, para quem quer cobrar condições essenciais da pergunta original |
+| Corte de cosseno antes do rerank | Rerank de todos os candidatos | Descarta candidatos distantes antes do cross-encoder |
 | Cota por frase e MMR | Só os maiores scores | Um tema com frases muito diretas não ocupa todas as vagas |
 | Saída estruturada com IDs | Resposta em texto livre | O código consegue validar as citações |
 | Panorama calculado com pandas | Pedir frequências ao LLM | O LLM vê no máximo 20 avaliações e não tem como estimar frequências da base |
 | Metadados separados do texto do cliente no contexto | Metadados e texto no mesmo bloco | Evita atribuir ao cliente um atraso que só consta nos dados do pedido |
-| Status de erro com nova tentativa | Regras de reserva quando o LLM falha | As regras de reserva pulariam a checagem de escopo |
+| Regras de reserva quando o LLM falha, com aviso | Só status de erro | A busca e as evidências continuam disponíveis sem chave, sem cota ou em timeout; o aviso deixa claro que o escopo não foi verificado. Se a geração falhar, o status de erro mantém as evidências e a interface oferece nova tentativa |
 | Sem campo de "confiança" na resposta | Confiança autodeclarada pelo LLM | O número não é calibrado; as barreiras e o rastreio dizem por que a resposta saiu |
-| Nota como filtro | Campo de sentimento derivado da nota | O sentimento repetiria a nota com outro nome |
+| Nota como filtro | Campo de sentimento derivado da nota | O sentimento repetiria a nota com outro nome; testamos o campo e o LLM continuou preferindo `score <= 2` para "clientes insatisfeitos" |
 | Classes com fluxo linear | LangGraph | O fluxo tem saídas antecipadas simples, e um grafo aumentaria o código |
 | Avaliação com split dev e test | Calibrar e medir nas mesmas perguntas | Evita ajustar o corte às perguntas usadas para relatar o resultado |
 
 ## Como executar
 
-Você precisa de Python 3.11 ou superior e da chave de API da OpenAI ou do Google Gemini.
+Você precisa de Python 3.11 ou superior. A chave de API da OpenAI ou do Google Gemini é usada na análise da pergunta e na síntese; sem ela, a busca funciona com as regras de reserva. Na primeira execução, o `sentence-transformers` baixa o E5 (cerca de 470 MB) e o cross-encoder (cerca de 470 MB) do Hugging Face.
 
 ```bash
 git clone <url-do-repositorio>
@@ -344,21 +385,25 @@ Para perguntar pelo terminal, gerar os exemplos ou avaliar:
 ```bash
 python -m voc_rag.cli ask "O que os clientes relatam sobre problemas de entrega?"
 python -m voc_rag.cli examples
-python -m voc_rag.cli evaluate --judge                 # 23 perguntas em 4 configurações
+python -m voc_rag.cli evaluate --judge                 # 31 perguntas em 4 configurações
 python -m voc_rag.cli evaluate --split dev --configs full
 ```
 
 | Variável do `.env` | Padrão | Uso |
 |---|---|---|
-| `LLM_PROVIDER` | `openai` | Provedor do chat e do rerank: `openai` ou `google` |
+| `LLM_PROVIDER` | `openai` | Provedor do chat (e do rerank com `RERANKER=llm`): `openai` ou `google` |
 | `OPENAI_API_KEY` ou `GOOGLE_API_KEY` | sem padrão | Chave do provedor |
 | `CHAT_MODEL` | `gpt-5.6-luna` | Modelo de análise e geração |
-| `RERANK_MODEL` | o `CHAT_MODEL` | Modelo do rerank; use um modelo barato do mesmo provedor |
+| `RERANKER` | `cross_encoder` | `cross_encoder` (local) ou `llm` |
+| `CROSS_ENCODER_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder do rerank local |
+| `MIN_RERANK_SCORE` | `-1.0` | Logit mínimo do cross-encoder |
+| `RERANK_MODEL` | o `CHAT_MODEL` | Modelo do rerank com `RERANKER=llm`; use um modelo barato do mesmo provedor |
 | `JUDGE_PROVIDER` e `JUDGE_MODEL` | os do chat | Juiz da avaliação; use outro provedor para reduzir o viés |
 | `LLM_TEMPERATURE` | não enviada | Defina só para modelos que aceitam temperatura |
-| `EMBEDDING_PROVIDER` | `openai` | Provedor dos embeddings |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | Modelo de embeddings |
-| `MIN_SIMILARITY` | `0.40` | Similaridade mínima para um candidato seguir na busca |
+| `EMBEDDING_PROVIDER` | `local` | Provedor dos embeddings: `local`, `openai` ou `google` |
+| `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | Modelo de embeddings |
+| `VECTOR_STORE` | `faiss` | Banco vetorial: `faiss` ou `chroma` |
+| `MIN_SIMILARITY` | `0.80` no E5, `0.40` nos modelos por API | Similaridade mínima para um candidato seguir na busca |
 | `USE_MULTI_QUERY`, `USE_BM25`, `USE_RERANK` | `true` | Componentes da busca |
 
 Se você trocar o modelo de embeddings, rode `index` de novo e recalibre `MIN_SIMILARITY`.
@@ -369,7 +414,7 @@ A pasta `notebooks/` tem dois notebooks para leitura e apresentação visual dos
 
 O `01_eda_e_montagem_da_base.ipynb` descreve as oito tabelas da Olist, com o significado de cada coluna e a distribuição dos valores. Em seguida, testa as ligações entre tabelas, monta a tabela final passo a passo e confere que o resultado é igual à saída da `ReviewDataPreparer`. Ele roda sem a API.
 
-O `02_pipeline_rag_passo_a_passo.ipynb` executa o pipeline uma etapa por vez. Você vê o documento, os embeddings, as frases de busca, os filtros, os candidatos do Chroma, o funil da busca híbrida com o rerank, as evidências, o prompt, a resposta e a validação das citações. A última seção compara a similaridade de perguntas com e sem resposta na base. Ele precisa da chave da API no `.env`.
+O `02_pipeline_rag_passo_a_passo.ipynb` executa o pipeline uma etapa por vez. Você vê o documento, os embeddings, as frases de busca, os filtros, os candidatos do FAISS, o funil da busca híbrida com o rerank, as evidências, o prompt, a resposta e a validação das citações. A última seção compara a similaridade de perguntas com e sem resposta na base. Ele precisa da chave da API no `.env`.
 
 ```bash
 jupyter notebook notebooks/
@@ -415,8 +460,9 @@ voc-rag-olist/
 │   ├── reranker.py
 │   ├── retriever.py
 │   ├── schemas.py
-│   └── stats.py
-├── tests/                # testes sem API, com dublês do LLM e do Chroma
+│   ├── stats.py
+│   └── vector_store.py
+├── tests/                # testes sem API, com dublês do LLM e do banco vetorial
 ├── notebooks/
 │   ├── 01_eda_e_montagem_da_base.ipynb
 │   └── 02_pipeline_rag_passo_a_passo.ipynb
@@ -425,6 +471,7 @@ voc-rag-olist/
 │   └── eval_set.json     # temas de recuperação e perguntas dev e test da avaliação
 ├── docs/                 # exemplos.md, avaliacao.md, classes_e_funcoes.md e roteiro do vídeo
 ├── data/raw/             # CSVs do Kaggle, fora do git
+├── data/faiss/           # índice FAISS e lista de IDs, um par por modelo de embeddings
 ├── requirements.txt
 └── .env.example
 ```
@@ -435,5 +482,8 @@ voc-rag-olist/
 - Em 727 pedidos com produtos de categorias diferentes, o preparador usa a categoria do item mais caro.
 - O sistema não conta quantas vezes um tema aparece nos comentários. Os números da resposta vêm dos dados estruturados. Um próximo passo seria classificar todas as avaliações por tema, offline, e combinar essas contagens com o RAG.
 - A relevância da avaliação de recuperação é aproximada por expressões regulares. Um gabarito anotado à mão permitiria medir recall@k e nDCG.
-- O rerank e o juiz são LLMs: as notas variam um pouco entre execuções, e o juiz da mesma família do gerador tende a favorecer as próprias respostas.
-- O custo e o tempo de resposta dependem da API e do modelo escolhido. O rerank acrescenta uma chamada por frase de busca.
+- O juiz é um LLM: os vereditos variam um pouco entre execuções, e o juiz da mesma família do gerador tende a favorecer as próprias respostas. Com `RERANKER=llm`, o rerank também varia.
+- O cross-encoder compara a frase de busca com a avaliação e não lê a pergunta original. Condições essenciais que não viram filtro ("entregas por drone") dependem da frase de busca preservá-las e do gerador recusar.
+- Nas regras de reserva, perguntas específicas usam a própria pergunta como frase de busca, e o cross-encoder costuma reprovar frases abstratas: sem LLM, "O que dizem sobre a embalagem?" é recusada, enquanto perguntas de panorama, que usam subtemas prontos, respondem com evidências.
+- As regras de reserva não verificam o escopo: sem LLM, "qual a capital da França?" segue para a busca e só as barreiras de similaridade e de rerank podem recusá-la.
+- O custo e o tempo de resposta dependem da API e do modelo escolhido para análise e geração. O rerank local roda na CPU; com `RERANKER=llm`, ele acrescenta uma chamada por frase de busca.

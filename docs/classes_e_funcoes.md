@@ -24,17 +24,19 @@ flowchart TD
     PREP --> BASE[Base analítica]
     PREP --> DOCS[Documentos indexáveis]
     DOCS --> IDX[ReviewIndexer]
-    IDX --> CHROMA[(Chroma)]
+    IDX --> CHROMA[(FAISS ou Chroma)]
     DOCS --> LEX[LexicalIndex BM25]
     Q[Pergunta e recorte opcional] --> PIPE[VoCPipeline.ask]
     PIPE --> ANALYZER[QueryAnalyzer]
+    ANALYZER -.->|falha do LLM| RULES[rules_analysis]
+    RULES --> SCOPE
     ANALYZER --> SCOPE{Dentro do escopo?}
     SCOPE -->|Não| OUT[OUT_OF_SCOPE]
     SCOPE -->|Sim| RET[ReviewRetriever]
     SCOPE -->|Sim| STATS[ReviewStats]
     CHROMA --> RET
     LEX --> RET
-    RET --> RR[LLMReranker]
+    RET --> RR[CrossEncoderReranker ou LLMReranker]
     RR --> RET
     BASE --> STATS
     RET --> MIN{Quantidade mínima de evidências?}
@@ -59,29 +61,33 @@ Guarda os caminhos dos arquivos, os provedores, os modelos e os parâmetros da b
 
 | Atributo | Padrão no código | Finalidade |
 |---|---|---|
-| `raw_dir`, `processed_dir`, `chroma_dir`, `eval_dir` | pastas em `ROOT / "data"` | CSVs de origem, Parquet preparados, banco vetorial e saída da avaliação. |
+| `raw_dir`, `processed_dir`, `chroma_dir`, `faiss_dir`, `eval_dir` | pastas em `ROOT / "data"` | CSVs de origem, Parquet preparados, bancos vetoriais e saída da avaliação. |
 | `llm_provider` | `LLM_PROVIDER` ou `openai` | Provedor do chat: `openai` ou `google`. |
 | `chat_model` | `CHAT_MODEL` ou `gpt-5.6-luna` | Modelo que analisa a pergunta e gera a resposta. |
-| `rerank_model` | `RERANK_MODEL` ou o `chat_model` | Modelo que dá as notas de relevância; use um modelo barato. |
+| `reranker` | `RERANKER` ou `cross_encoder` | `cross_encoder` (local) ou `llm`. |
+| `cross_encoder_model` | `CROSS_ENCODER_MODEL` ou `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder multilíngue do rerank local. |
+| `rerank_model` | `RERANK_MODEL` ou o `chat_model` | Modelo que dá as notas de relevância com `RERANKER=llm`; use um modelo barato. |
 | `judge_provider`, `judge_model` | `JUDGE_PROVIDER` e `JUDGE_MODEL`, ou os do chat | Juiz da avaliação de fundamentação. |
 | `temperature` | `LLM_TEMPERATURE` ou `None` | Só é enviada quando definida; modelos de raciocínio recusam o parâmetro. |
-| `embedding_provider` | `EMBEDDING_PROVIDER` ou `openai` | Provedor dos embeddings. |
-| `embedding_model` | `EMBEDDING_MODEL` ou o padrão do provedor | `text-embedding-3-small` (OpenAI) ou `gemini-embedding-2-preview` (Google). |
-| `min_similarity` | `MIN_SIMILARITY` ou `0.40` | Similaridade de cosseno mínima de um candidato. |
+| `embedding_provider` | `EMBEDDING_PROVIDER` ou `local` | Provedor dos embeddings: `local`, `openai` ou `google`. |
+| `embedding_model` | `EMBEDDING_MODEL` ou o padrão do provedor | `intfloat/multilingual-e5-small` (local), `text-embedding-3-small` (OpenAI) ou `gemini-embedding-2-preview` (Google). |
+| `vector_store` | `VECTOR_STORE` ou `faiss` | Banco vetorial: `faiss` ou `chroma`. |
+| `min_similarity` | `MIN_SIMILARITY` ou o padrão do provedor | Similaridade de cosseno mínima de um candidato: 0,80 no E5 local e 0,40 nos modelos por API. |
 | `use_multi_query`, `use_bm25`, `use_rerank` | `USE_MULTI_QUERY`, `USE_BM25`, `USE_RERANK` ou `true` | Ligam os componentes da busca. |
-| `fetch_k`, `lexical_k` | `40` | Candidatos pedidos ao Chroma e ao BM25 por frase de busca. |
+| `fetch_k`, `lexical_k` | `40` | Candidatos pedidos ao banco vetorial e ao BM25 por frase de busca. |
 | `rerank_k` | `30` | Candidatos por frase enviados ao rerank. |
 | `rrf_k` | `60` | Constante do Reciprocal Rank Fusion. |
-| `min_relevance` | `2` | Nota mínima do rerank (0 a 3) para uma avaliação virar evidência. |
+| `min_relevance` | `2` | Nota mínima do rerank por LLM (0 a 3) para uma avaliação virar evidência. |
+| `min_rerank_score` | `MIN_RERANK_SCORE` ou `-1.0` | Logit mínimo do cross-encoder para uma avaliação virar evidência. |
 | `mmr_lambda` | `0.7` | Peso da relevância no MMR; o restante pesa a diversidade. |
 | `top_k`, `overview_top_k` | `12`, `20` | Máximo de evidências em perguntas específicas e de panorama. |
 | `min_evidences` | `3` | Mínimo de evidências para chamar o gerador. |
 
-O construtor consulta as variáveis de ambiente ao criar a instância, e `__post_init__` preenche os campos vazios que herdam outro valor. Para alterar um valor em código, passe o campo na chamada, como `Settings(top_k=8)`, ou use `dataclasses.replace(settings, use_rerank=False)`.
+O construtor consulta as variáveis de ambiente ao criar a instância, e `__post_init__` valida `embedding_provider`, `vector_store` e `reranker` e preenche os campos vazios que herdam outro valor. Para alterar um valor em código, passe o campo na chamada, como `Settings(top_k=8)`, ou use `dataclasses.replace(settings, use_rerank=False)`.
 
 #### `Settings.collection_name`
 
-Deriva o nome da coleção do modelo de embeddings, como `olist_reviews_text_embedding_3_small`. Cada modelo tem sua própria coleção no Chroma.
+Deriva o nome da coleção do modelo de embeddings, como `olist_reviews_intfloat_multilingual_e5_small`. Cada modelo tem sua própria coleção no Chroma e seus próprios arquivos no FAISS (`faiss_index_path` e `faiss_ids_path`).
 
 #### `Settings.analytics_path` e `Settings.documents_path`
 
@@ -105,7 +111,11 @@ Cria o modelo de chat com `init_chat_model` do LangChain. Envia `temperature` s�
 
 ### Função `create_embeddings(settings)`
 
-Devolve `OpenAIEmbeddings` ou `GoogleGenerativeAIEmbeddings`, conforme `embedding_provider`. No Gemini, a biblioteca usa as tarefas de documento e de consulta em `embed_documents` e `embed_query`.
+Devolve `E5Embeddings`, `OpenAIEmbeddings` ou `GoogleGenerativeAIEmbeddings`, conforme `embedding_provider`. No Gemini, a biblioteca usa as tarefas de documento e de consulta em `embed_documents` e `embed_query`.
+
+### Classe `E5Embeddings`
+
+Embeddings locais com `sentence-transformers`. `embed_documents` acrescenta o prefixo `passage: ` e `embed_query`, o prefixo `query: `, como a família E5 exige; os vetores saem normalizados. Outros modelos locais recebem o texto sem prefixo.
 
 ## 3. Estruturas de dados: `voc_rag/schemas.py`
 
@@ -119,7 +129,7 @@ Define os filtros de uma pergunta: `min_score`, `max_score`, `delivery_status`, 
 
 #### `ReviewFilters.conditions()`
 
-Converte os campos em uma lista de tuplas `(coluna, operador, valor)`. O Chroma, o BM25 e as estatísticas usam essa mesma lista, que a interface exibe como filtros aplicados.
+Converte os campos em uma lista de tuplas `(coluna, operador, valor)`. O banco vetorial, o BM25 e as estatísticas usam essa mesma lista, que a interface exibe como filtros aplicados.
 
 - Inclui os limites de nota quando pertencem ao intervalo de 1 a 5.
 - Usa igualdade para categoria e situação de entrega.
@@ -142,6 +152,8 @@ Guarda a interpretação que `QueryAnalyzer.analyze()` obtém do modelo:
 | `question_type` | `overview` para perguntas de panorama ou `specific` para perguntas pontuais. |
 | `search_queries` | Frases escritas como um cliente escreveria, de 1 a 2 em `specific` e de 4 a 6 em `overview`. |
 | `filters` | Objeto `ReviewFilters` com as restrições extraídas. |
+
+A propriedade `source` informa se a análise veio do LLM (`llm`) ou das regras de fallback (`rules`); é um atributo privado e não entra no esquema enviado ao modelo.
 
 ### Classes `Insight` e `GeneratedAnswer`
 
@@ -168,7 +180,7 @@ Guarda a interpretação que `QueryAnalyzer.analyze()` obtém do modelo:
 | `review_id` | ID da avaliação exibida. |
 | `matched_query` | Frase de busca que encontrou a avaliação. |
 | `dense_rank`, `lexical_rank` | Posição na busca densa e no BM25, ou `None` quando a avaliação não apareceu na lista. |
-| `relevance` | Nota do rerank, de 0 a 3, ou `None` com o rerank desligado. |
+| `relevance` | Logit do cross-encoder ou nota do LLM (0 a 3), ou `None` com o rerank desligado. |
 
 ### Classe `PipelineResult`
 
@@ -217,27 +229,36 @@ Combina os DataFrames de `tables` (`reviews`, `orders`, `items`, `products` e `c
 - `_main_category(items, products)`: usa a categoria do item de maior preço do pedido.
 - `_report(raw, base)`: monta o relatório com contagens, ausências, taxa de comentário por nota e nota 1 por situação de entrega.
 
-## 5. Indexação: `voc_rag/indexing.py`
+## 5. Indexação: `voc_rag/indexing.py` e `voc_rag/vector_store.py`
 
-[Abrir arquivo](../voc_rag/indexing.py)
+[Abrir indexing.py](../voc_rag/indexing.py) · [Abrir vector_store.py](../voc_rag/vector_store.py)
 
 ### Função `create_vector_store(settings)`
 
-Cria o `Chroma` da coleção `settings.collection_name` em `chroma_dir`, com os embeddings de `create_embeddings`. A coleção usa distância de cosseno explícita (`collection_configuration={"hnsw": {"space": "cosine"}}`) e guarda o provedor e o modelo nos metadados.
+Cria os embeddings e devolve um `FaissReviewStore` (padrão) ou um `ChromaReviewStore`, conforme `vector_store`. Os dois oferecem a mesma interface ao retriever: `embeddings`, `count()`, `search(query_vector, k, filters)` e `fetch(ids)`.
 
 ### Função `check_index(store, settings)`
 
-Compara a quantidade de documentos da coleção com a do Parquet de documentos e levanta um erro que pede `index` quando elas diferem.
+Compara a quantidade de documentos do índice com a do Parquet de documentos e levanta um erro que pede `index` quando elas diferem.
 
 ### Classe `ReviewIndexer`
 
-#### `ReviewIndexer.build()`
+`build()` lê `documents_path` e grava o índice do banco configurado: no FAISS, gera os embeddings de todos os textos e cria um `IndexFlatIP` exato; no Chroma, recria a coleção do modelo e envia lotes de 1.000 documentos.
 
-Lê `documents_path`, converte as linhas em `Document` por `_to_document()`, recria só a coleção do modelo atual (`reset_collection`) e envia lotes de `BATCH_SIZE=1000` documentos com seus IDs originais. Devolve a quantidade indexada.
+### Classe `FaissReviewStore`
 
-#### `ReviewIndexer._to_document(row)`
+- `build(settings, embeddings, documents)`: normaliza os vetores, cria o `IndexFlatIP` (produto interno de vetores normalizados, ou seja, cosseno) e grava o índice e a lista de `review_id` em `faiss_dir`.
+- `load(settings, embeddings)`: lê o índice e confere se a lista de IDs é a mesma do Parquet de documentos.
+- `search(query_vector, k, filters)`: transforma o filtro numa máscara com `filter_mask` e passa as posições permitidas ao `IDSelectorBatch`. O FAISS compara a consulta só com o recorte, então a busca continua exata em recortes pequenos.
+- `fetch(ids)`: devolve texto, metadados e vetor de cada ID; o vetor vem de `index.reconstruct`, sem recalcular embeddings.
 
-Usa `review_id` como `id`, `text` como `page_content` e os valores não nulos de `METADATA_COLUMNS` como metadados.
+### Classe `ChromaReviewStore`
+
+Adapta o `langchain_chroma.Chroma` à mesma interface. `to_chroma_filter(filters)` converte `conditions()` para `$gte`, `$lte`, `$eq` e `$in` e devolve `None`, uma condição ou um `$and`. A coleção usa distância de cosseno explícita e guarda o provedor e o modelo nos metadados.
+
+### Função `search_with_similarity(store, query, k, filters=None)`
+
+Busca um texto e devolve `(texto, metadados, cosseno)` de cada resultado. O notebook do pipeline usa essa função.
 
 ## 6. Interpretação: `voc_rag/query_analyzer.py`
 
@@ -247,11 +268,23 @@ Usa `review_id` como `id`, `text` como `page_content` e os valores não nulos de
 
 #### `QueryAnalyzer.__init__(llm, categories)`
 
-Monta o prompt com `ANALYZER_SYSTEM` e a lista de categorias e configura o `llm` para devolver um `QueryAnalysis`.
+Monta o prompt com `ANALYZER_SYSTEM` e a lista de categorias e configura o `llm` para devolver um `QueryAnalysis`. Com `llm=None` (sem chave de API), toda análise usa as regras.
 
 #### `QueryAnalyzer.analyze(question, manual_filters=None)`
 
-Envia a pergunta e, quando houver, o recorte manual descrito por `describe_filters`. Depois anula categorias fora da base, remove frases de busca vazias ou repetidas, limita a lista a `MAX_SEARCH_QUERIES=6` e usa a própria pergunta se não sobrar nenhuma frase.
+Envia a pergunta e, quando houver, o recorte manual descrito por `describe_filters`. Se a chamada falhar, registra um aviso e devolve `rules_analysis`. Depois aproxima a categoria da grafia da base com `CategoryMatcher` (e a anula se nada for parecido), remove frases de busca vazias ou repetidas, limita a lista a `MAX_SEARCH_QUERIES=6` e usa a própria pergunta se não sobrar nenhuma frase.
+
+### Classe `CategoryMatcher`
+
+Normaliza nomes de categoria (minúsculas, sem acentos, sem pontuação e sem conectivos como "e" e "de") e usa `difflib.get_close_matches` com corte de 0,75: "cama, mesa e banho" e "Cama Mesa Banho" viram `cama_mesa_banho`. `find_in(text)` procura a categoria mais longa citada num texto.
+
+### Função `rules_analysis(question, categories)`
+
+Fallback determinístico. Marca a pergunta como dentro do escopo, já que as regras não verificam escopo, e:
+
+- "nota baixa" e "insatisfeitos" viram `max_score=2`; "nota alta", "elogios" e "satisfeitos" viram `min_score=4`; "reclamações" e "problemas" só trocam os subtemas, sem filtro de nota, como no prompt do LLM;
+- "principais", "padrões" e "recorrentes" marcam a pergunta como panorama e usam os subtemas `NEGATIVE_TOPICS` ou `POSITIVE_TOPICS` como frases de busca; nas outras, a própria pergunta é a frase;
+- lê mês e ano ("novembro de 2017", "em 2018"), situação de entrega ("pedidos entregues com atraso", "não chegou"), categoria e estados (siglas e nomes por extenso).
 
 ## 7. Busca lexical: `voc_rag/lexical.py`
 
@@ -275,15 +308,19 @@ Pontua os documentos, zera a pontuação de quem está fora de `filter_mask` e d
 
 [Abrir arquivo](../voc_rag/reranker.py)
 
+Os dois rerankers têm a mesma interface: `grade(question, filters, queries, texts)` devolve, para cada frase, a relevância de cada candidato; `min_score` é o corte; `score(relevance, similarity)` dá a escala usada pelo MMR. `create_reranker(settings)` escolhe a classe conforme `settings.reranker`.
+
+### Classe `CrossEncoderReranker`
+
+Usa o cross-encoder `mmarco-mMiniLMv2-L12-H384-v1`, que lê a frase de busca e a avaliação juntas. Envia todos os pares de todas as frases num único lote e devolve logits contínuos. O corte vem de `settings.min_rerank_score` (−1 por padrão), e o `score` usado pelo MMR é a sigmoide do logit. É determinístico e não custa nada por consulta.
+
 ### Classes `Grade` e `RelevanceGrades`
 
-Esquema da saída estruturada do rerank: uma nota de 0 a 3 para cada ID de candidato (`C1`, `C2`…).
+Esquema da saída estruturada do rerank por LLM: uma nota de 0 a 3 para cada ID de candidato (`C1`, `C2`…).
 
 ### Classe `LLMReranker`
 
-#### `LLMReranker.grade(question, filters, queries, texts)`
-
-Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada chamada recebe a pergunta original, a descrição do filtro aplicado, a frase de busca e os candidatos numerados. Devolve, para cada frase, a lista de notas na ordem dos candidatos; IDs ausentes ou inválidos ficam com nota 0, e notas fora de 0 a 3 são limitadas a esse intervalo.
+Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada chamada recebe a pergunta original, a descrição do filtro aplicado, a frase de busca e os candidatos numerados. IDs ausentes ou inválidos ficam com nota 0, e notas fora de 0 a 3 são limitadas a esse intervalo. O corte é `min_relevance=2`, e o `score` vale `(nota + similaridade) / 4`: a nota domina e a similaridade desempata.
 
 ## 9. Recuperação: `voc_rag/retriever.py`
 
@@ -291,7 +328,6 @@ Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada ch
 
 ### Funções auxiliares
 
-- `to_chroma_filter(filters)`: converte `conditions()` para `$gte`, `$lte`, `$eq` e `$in`; devolve `None`, uma condição ou um `$and`.
 - `describe_filters(filters)`: descreve as condições em texto, ou "nenhum".
 - `reciprocal_rank_fusion(rankings, k)`: soma `1 / (k + posição)` de cada lista e ordena pela soma.
 - `text_key(text)`: normaliza o texto para agrupar repetidos (minúsculas, espaços e pontuação final).
@@ -300,24 +336,24 @@ Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada ch
 
 ### Classes `Candidate` e `Retrieval`
 
-`Candidate` guarda um candidato com texto, metadados, vetor, similaridade, frase de busca, posições nas buscas e nota do rerank. A propriedade `score` alimenta o MMR: com rerank, vale `(nota + similaridade) / 4`, e a nota domina enquanto a similaridade desempata; sem rerank, vale a similaridade. `Retrieval` reúne as evidências e o funil.
+`Candidate` guarda um candidato com texto, metadados, vetor, similaridade, frase de busca, posições nas buscas e nota do rerank. A propriedade `score` alimenta o MMR: com rerank, vale o `score` do reranker (sigmoide do logit ou `(nota + similaridade) / 4`); sem rerank, vale a similaridade. `Retrieval` reúne as evidências e o funil.
 
 ### Classe `ReviewRetriever`
 
 #### `ReviewRetriever.__init__(vector_store, settings, lexical=None, reranker=None)`
 
-Recebe o Chroma, as configurações e, opcionalmente, o `LexicalIndex` e o `LLMReranker`.
+Recebe o banco vetorial (`FaissReviewStore` ou `ChromaReviewStore`), as configurações e, opcionalmente, o `LexicalIndex` e o reranker.
 
 #### `ReviewRetriever.rank(question, queries, filters)`
 
 Para cada frase de busca, `_candidates`:
 
-1. gera o embedding da frase e busca `fetch_k` documentos no Chroma com o filtro;
+1. gera o embedding da frase e busca `fetch_k` documentos no banco vetorial com o filtro;
 2. busca `lexical_k` documentos no BM25, quando ligado, e funde as listas por RRF;
-3. lê os embeddings dos candidatos no Chroma e calcula o cosseno com a frase, o que também vale para os candidatos que vieram só do BM25;
+3. lê os vetores dos candidatos no índice (`fetch`) e calcula o cosseno com a frase, o que também vale para os candidatos que vieram só do BM25;
 4. descarta candidatos abaixo de `min_similarity`.
 
-Com o rerank ligado, envia até `rerank_k` candidatos por frase ao `LLMReranker`, mantém os com nota `>= min_relevance` e ordena por nota, preservando a ordem da fusão nos empates. Devolve as listas por frase e o funil (`dense`, `lexical`, `fused`, `above_similarity`, `best_similarity`, `relevant` e `best_relevance`).
+Com o rerank ligado, envia até `rerank_k` candidatos por frase ao reranker, mantém os com relevância `>= reranker.min_score` e ordena por relevância, preservando a ordem da fusão nos empates. Devolve as listas por frase e o funil (`dense`, `lexical`, `fused`, `above_similarity`, `best_similarity`, `relevant` e `best_relevance`).
 
 #### `ReviewRetriever.retrieve(question, queries, filters, top_k, on_progress=None)`
 
@@ -366,7 +402,7 @@ Monta um bloco por evidência com o ID, os metadados do pedido (identificados co
 
 #### `AnswerGenerator.generate(question, evidences, overview)`
 
-Envia ao modelo a pergunta, o panorama e o contexto. Depois limpa as citações de cada achado, descarta achados sem citação válida e registra quantos foram descartados em `dropped_insights`. O código confere que os IDs existem, mas não verifica se o texto citado comprova a afirmação; essa conferência é feita na avaliação, pelo juiz.
+Envia ao modelo a pergunta, o panorama e o contexto. Com `llm=None`, a propriedade `available` é falsa e o pipeline não chama o gerador. Depois limpa as citações de cada achado, descarta achados sem citação válida e registra quantos foram descartados em `dropped_insights`. O código confere que os IDs existem, mas não verifica se o texto citado comprova a afirmação; essa conferência é feita na avaliação, pelo juiz.
 
 ## 12. Orquestração: `voc_rag/pipeline.py`
 
@@ -386,21 +422,21 @@ Recebe os componentes prontos, o que permite substituí-los nos testes e na aval
 
 Processa a pergunta e devolve um `PipelineResult`, registrando os tokens de cada modelo e o tempo total no `trace`. O `on_progress` opcional, do tipo `ProgressCallback`, recebe o nome de cada etapa concluída e os dados dela: `analyzed` (tipo da pergunta, frases de busca e filtro), `candidates` (total de candidatos e se o rerank vem a seguir, enviado pelo retriever) e `retrieved` (evidências selecionadas e se bastam para responder). A interface usa esses eventos para mostrar o progresso.
 
-1. Interpreta a pergunta com `analyzer.analyze()`, enviando o recorte manual. Se o LLM falhar, devolve `ERROR`.
+1. Interpreta a pergunta com `analyzer.analyze()`, enviando o recorte manual. Se o LLM falhar, o analisador usa as regras; o pipeline registra `analysis_source` no `trace` e acrescenta `RULES_NOTICE` aos avisos. Só uma exceção do próprio analisador devolve `ERROR`.
 2. Se estiver fora do escopo, devolve `OUT_OF_SCOPE` sem buscar.
 3. Monta o filtro aplicado: vazio com `use_filters=False`, ou a mescla do filtro da pergunta com o recorte manual, com aviso quando há substituição.
 4. Usa todas as frases de busca com `use_multi_query` ligado, ou só a primeira, e `overview_top_k` vagas em perguntas de panorama.
 5. Se nenhuma avaliação da base atende ao filtro, como um ano fora do período da base, devolve `INSUFFICIENT` com `EMPTY_FILTER_MESSAGE`, que descreve o recorte e o período coberto, e registra a barreira `empty_filter`, sem buscar.
 6. Recupera as evidências e calcula o panorama com o mesmo filtro.
 7. Com menos de `min_evidences`, devolve `INSUFFICIENT` sem chamar o gerador e registra a barreira.
-8. Chama o gerador. Se ele indicar insuficiência ou não sobrarem achados com citações válidas, devolve `INSUFFICIENT` com as limitações.
+8. Sem LLM disponível, devolve `ERROR` com `GENERATION_UNAVAILABLE_MESSAGE`, as evidências e o panorama, e registra a barreira `no_llm`. Caso contrário, chama o gerador. Se ele indicar insuficiência ou não sobrarem achados com citações válidas, devolve `INSUFFICIENT` com as limitações.
 9. Caso contrário, devolve `ANSWERED`.
 
 Falhas na busca ou na geração também devolvem `ERROR`, mantendo a análise e as evidências já obtidas.
 
 ### Função `build_pipeline(settings=None)`
 
-Cria os modelos de chat e de rerank, lê a base analítica, conecta o Chroma e confere o índice, monta o `LexicalIndex` e o `LLMReranker` conforme as chaves de `Settings` e devolve o pipeline.
+Cria o modelo de chat (ou segue sem ele, com um aviso, quando falta a chave de API), lê a base analítica, conecta o banco vetorial e confere o índice, monta o `LexicalIndex` e o reranker de `create_reranker` conforme as chaves de `Settings` e devolve o pipeline.
 
 ## 13. Avaliação: `voc_rag/evaluation.py`
 
@@ -416,7 +452,7 @@ Guarda a análise de cada pergunta e seus tokens, para que todas as configuraç�
 
 ### Classe `EvaluationRunner`
 
-- `evaluate_retrieval(themes)`: calcula a precisão@10 de cada tema nas quatro configurações de ranking, sem corte de similaridade e sem descartar notas baixas.
+- `evaluate_retrieval(themes)`: calcula a precisão@10 de cada tema nas quatro configurações de ranking, sem corte de similaridade e sem o corte do reranker.
 - `evaluate_questions(questions, configs, repeat)`: roda as perguntas em cada configuração e repetição e registra status, acerto, barreira, evidências, filtros, tokens e tempo.
 - `judge_result(result)`: pede ao juiz um veredito por achado (`sim`, `parcial` ou `nao`) e se o achado atribui ao cliente algo que só está nos metadados.
 
@@ -477,7 +513,7 @@ O arquivo está vazio e marca `voc_rag` como um pacote Python.
 
 [Abrir pasta](../tests/)
 
-Rode `python -m unittest discover -s tests -v`. Os testes não chamam a API: `tests/fakes.py` imita o Chroma, o BM25 e o rerank, e os testes do pipeline usam dublês do analisador e do gerador. Eles cobrem filtros e mescla, limpeza e montagem da base com tabelas sintéticas, citações, agrupamento de repetidos, cota por frase, BM25, rerank, panorama e as transições de status.
+Rode `python -m unittest discover -s tests -v`. Os testes não chamam a API: `tests/fakes.py` imita o banco vetorial, o BM25 e o rerank, e os testes do FAISS usam um índice real com vetores sintéticos, e os testes do pipeline usam dublês do analisador e do gerador. Eles cobrem filtros e mescla, pré-filtro e `reconstruct` do FAISS, prefixos do E5, lote do cross-encoder, fallback por regras e correspondência de categorias, limpeza e montagem da base com tabelas sintéticas, citações, agrupamento de repetidos, cota por frase, BM25, rerank, panorama e as transições de status.
 
 ## 18. Funções didáticas dos notebooks
 

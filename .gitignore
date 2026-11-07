@@ -17,6 +17,7 @@ data/raw/*.csv
 data/raw/*.zip
 data/processed/
 data/chroma/
+data/faiss/
 data/eval/
 
 # Editor e sistema operacional

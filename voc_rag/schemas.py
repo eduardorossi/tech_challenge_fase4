@@ -29,9 +29,10 @@ class ReviewFilters(BaseModel):
 
     def conditions(self) -> list[tuple[str, str, str | int | list[str]]]:
         conditions = []
-        if self.min_score in range(1, 6):
+        # Nota mínima 1 e máxima 5 não restringem nada e ficam de fora.
+        if self.min_score in range(2, 6):
             conditions.append(("score", ">=", self.min_score))
-        if self.max_score in range(1, 6):
+        if self.max_score in range(1, 5):
             conditions.append(("score", "<=", self.max_score))
         if self.delivery_status:
             conditions.append(("delivery_status", "==", self.delivery_status))
@@ -65,6 +66,12 @@ class QueryAnalysis(BaseModel):
         description="Frases escritas como um cliente escreveria uma avaliação: 1 ou 2 em specific, 4 a 6 em overview"
     )
     filters: ReviewFilters
+    # "llm" ou "rules" (fallback quando o modelo de linguagem falha); fica fora do esquema enviado ao LLM.
+    _source: str = PrivateAttr(default="llm")
+
+    @property
+    def source(self) -> str:
+        return self._source
 
 
 class Insight(BaseModel):
@@ -103,7 +110,7 @@ class Evidence:
     matched_query: str = ""
     dense_rank: int | None = None
     lexical_rank: int | None = None
-    relevance: int | None = None
+    relevance: float | None = None
 
 
 @dataclass

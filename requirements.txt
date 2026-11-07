@@ -1,3 +1,16 @@
+# PyTorch versão CPU, do índice oficial do PyTorch (o PyPI continua sendo usado para o resto).
+# 2.5.1 porque as versões >= 2.6 exigem Visual C++ Redistributable recente no Windows.
+#   Windows e Linux x64 -> variante "+cpu"
+#   macOS Apple Silicon e Linux ARM -> versão padrão (já é só CPU)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu ; platform_machine == "AMD64" or platform_machine == "x86_64"
+torch==2.5.1 ; platform_machine == "arm64" or platform_machine == "aarch64"
+
+# Embeddings E5 e reranker cross-encoder locais; FAISS como banco vetorial padrão
+sentence-transformers>=3.3,<5.2
+transformers>=4.48,<5
+faiss-cpu>=1.9
+
 langchain>=1.0
 langchain-core>=1.0
 langchain-openai>=1.0

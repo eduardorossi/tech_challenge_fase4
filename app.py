@@ -56,7 +56,7 @@ ALL_OPTIONS = "Todas"
 TRACE_COLUMNS = {
     "query": "Frase de busca", "dense": "Busca densa", "lexical": "BM25", "fused": "Candidatos",
     "above_similarity": "Acima da similaridade mínima", "best_similarity": "Maior similaridade",
-    "relevant": "Relevantes no rerank", "best_relevance": "Maior nota do rerank", "selected": "Evidências usadas",
+    "relevant": "Relevantes no rerank", "best_relevance": "Maior relevância no rerank", "selected": "Evidências usadas",
 }
 
 
@@ -219,7 +219,8 @@ def render(result: PipelineResult, index: int) -> None:
                             help="Textos iguais agrupados na busca. O estado é o da avaliação exibida."
                         ),
                         "Relevância": st.column_config.NumberColumn(
-                            help="Nota de 0 a 3 dada pelo rerank à avaliação em relação à pergunta."
+                            help="Relevância dada pelo rerank: logit do cross-encoder (acima do corte, -1 por padrão, é relevante) ou nota de 0 a 3 do LLM.",
+                            format="%.2f",
                         ),
                         "Busca": st.column_config.TextColumn(help="Frase de busca que encontrou a avaliação."),
                     },

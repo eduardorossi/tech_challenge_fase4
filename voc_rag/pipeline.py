@@ -13,11 +13,11 @@ from voc_rag.lexical import LexicalIndex
 from voc_rag.llm import create_chat_model
 from voc_rag.labels import describe_conditions
 from voc_rag.prompts import (
-    EMPTY_FILTER_MESSAGE, ERROR_MESSAGE, FILTER_FIELD_LABELS, INSUFFICIENT_MESSAGE, OUT_OF_SCOPE_MESSAGE,
-    OVERRIDE_NOTICE,
+    EMPTY_FILTER_MESSAGE, ERROR_MESSAGE, FILTER_FIELD_LABELS, GENERATION_UNAVAILABLE_MESSAGE, INSUFFICIENT_MESSAGE,
+    OUT_OF_SCOPE_MESSAGE, OVERRIDE_NOTICE, RULES_NOTICE,
 )
 from voc_rag.query_analyzer import QueryAnalyzer
-from voc_rag.reranker import LLMReranker
+from voc_rag.reranker import create_reranker
 from voc_rag.retriever import ReviewRetriever
 from voc_rag.schemas import PipelineResult, QueryAnalysis, ReviewFilters, Status
 from voc_rag.stats import ReviewStats
@@ -77,11 +77,14 @@ class VoCPipeline:
             logger.exception("Falha na análise da pergunta")
             return PipelineResult(question, Status.ERROR, ERROR_MESSAGE, trace=trace | {"stopped_at": "error"})
         timings["analysis"] = round(time.perf_counter() - step, 2)
+        trace["analysis_source"] = analysis.source
         if not analysis.in_scope:
             trace["stopped_at"] = "scope"
             return PipelineResult(question, Status.OUT_OF_SCOPE, OUT_OF_SCOPE_MESSAGE, analysis=analysis, trace=trace)
 
         filters, notices = self._filters(analysis, manual_filters, use_filters)
+        if analysis.source == "rules":
+            notices.append(RULES_NOTICE)
         overview_question = self.settings.use_multi_query and analysis.question_type == "overview"
         queries = analysis.search_queries if self.settings.use_multi_query else analysis.search_queries[:1]
         top_k = self.settings.overview_top_k if overview_question else self.settings.top_k
@@ -117,6 +120,10 @@ class VoCPipeline:
             trace["stopped_at"] = refusal_gate(retrieval.trace)
             return base
 
+        if not self.generator.available:
+            # Sem LLM, a recuperação ainda entrega as evidências do recorte.
+            trace["stopped_at"] = "no_llm"
+            return replace(base, status=Status.ERROR, summary=GENERATION_UNAVAILABLE_MESSAGE)
         step = time.perf_counter()
         try:
             answer = self.generator.generate(question, retrieval.evidences, base.overview)
@@ -152,14 +159,17 @@ class VoCPipeline:
 
 def build_pipeline(settings: Settings | None = None) -> VoCPipeline:
     settings = settings or Settings()
-    llm = create_chat_model(settings.llm_provider, settings.chat_model, settings.temperature)
+    try:
+        llm = create_chat_model(settings.llm_provider, settings.chat_model, settings.temperature)
+    except RuntimeError as error:
+        # Sem chave de API: a análise cai nas regras e a busca continua funcionando.
+        logger.warning("%s A análise usará regras e a síntese ficará indisponível.", error)
+        llm = None
     stats = ReviewStats(pd.read_parquet(settings.analytics_path))
     store = create_vector_store(settings)
     check_index(store, settings)
     lexical = LexicalIndex(pd.read_parquet(settings.documents_path)) if settings.use_bm25 else None
-    reranker = None
-    if settings.use_rerank:
-        reranker = LLMReranker(create_chat_model(settings.llm_provider, settings.rerank_model, settings.temperature))
+    reranker = create_reranker(settings) if settings.use_rerank else None
     return VoCPipeline(
         analyzer=QueryAnalyzer(llm, stats.categories),
         retriever=ReviewRetriever(store, settings, lexical, reranker),
