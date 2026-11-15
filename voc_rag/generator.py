@@ -2,6 +2,7 @@ import re
 
 from langchain_core.prompts import ChatPromptTemplate
 
+from voc_rag.llm import structured_output_with_fallback
 from voc_rag.prompts import GENERATOR_HUMAN, GENERATOR_SYSTEM
 from voc_rag.schemas import Evidence, GeneratedAnswer
 
@@ -45,11 +46,11 @@ def format_context(evidences: list[Evidence]) -> str:
 
 
 class AnswerGenerator:
-    def __init__(self, llm):
+    def __init__(self, llm, fallback_llm=None):
         self.chain = None
         if llm is not None:
             prompt = ChatPromptTemplate.from_messages([("system", GENERATOR_SYSTEM), ("human", GENERATOR_HUMAN)])
-            self.chain = prompt | llm.with_structured_output(GeneratedAnswer)
+            self.chain = prompt | structured_output_with_fallback(llm, GeneratedAnswer, fallback_llm)
 
     @property
     def available(self) -> bool:

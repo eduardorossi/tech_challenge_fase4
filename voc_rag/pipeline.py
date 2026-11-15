@@ -10,7 +10,7 @@ from voc_rag.config import Settings
 from voc_rag.generator import AnswerGenerator
 from voc_rag.indexing import check_index, create_vector_store
 from voc_rag.lexical import LexicalIndex
-from voc_rag.llm import create_chat_model
+from voc_rag.llm import create_chat_model_pair
 from voc_rag.labels import describe_conditions
 from voc_rag.prompts import (
     EMPTY_FILTER_MESSAGE, ERROR_MESSAGE, FILTER_FIELD_LABELS, GENERATION_UNAVAILABLE_MESSAGE, INSUFFICIENT_MESSAGE,
@@ -158,21 +158,20 @@ class VoCPipeline:
 
 def build_pipeline(settings: Settings | None = None) -> VoCPipeline:
     settings = settings or Settings()
-    try:
-        llm = create_chat_model(settings.llm_provider, settings.chat_model, settings.temperature)
-    except RuntimeError as error:
-        # Sem chave de API: a análise cai nas regras e a busca continua funcionando.
-        logger.warning("%s A análise usará regras e a síntese ficará indisponível.", error)
-        llm = None
+    llm, fallback_llm = create_chat_model_pair(
+        settings.llm_provider, settings.chat_model, settings.temperature, settings.fallback_chat_model
+    )
+    if llm is None:
+        logger.warning("Nenhum modelo de chat disponível; a análise usará regras e a síntese ficará indisponível.")
     stats = ReviewStats(pd.read_parquet(settings.analytics_path))
     store = create_vector_store(settings)
     check_index(store, settings)
     lexical = LexicalIndex(pd.read_parquet(settings.documents_path)) if settings.use_bm25 else None
     reranker = create_reranker(settings) if settings.use_rerank else None
     return VoCPipeline(
-        analyzer=QueryAnalyzer(llm, stats.categories),
+        analyzer=QueryAnalyzer(llm, stats.categories, fallback_llm),
         retriever=ReviewRetriever(store, settings, lexical, reranker),
-        generator=AnswerGenerator(llm),
+        generator=AnswerGenerator(llm, fallback_llm),
         stats=stats,
         settings=settings,
     )

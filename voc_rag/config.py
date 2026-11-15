@@ -39,6 +39,7 @@ class Settings:
     eval_dir: Path = ROOT / "data" / "eval"
     llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "openai"))
     chat_model: str = field(default_factory=lambda: os.getenv("CHAT_MODEL", "gpt-5.6-luna"))
+    fallback_chat_model: str = field(default_factory=lambda: os.getenv("FALLBACK_CHAT_MODEL", "gemini-3.5-flash-lite"))
     rerank_model: str = field(default_factory=lambda: os.getenv("RERANK_MODEL", ""))
     judge_provider: str = field(default_factory=lambda: os.getenv("JUDGE_PROVIDER", ""))
     judge_model: str = field(default_factory=lambda: os.getenv("JUDGE_MODEL", ""))

@@ -1,6 +1,32 @@
 # Classes e funções do Voz do Cliente Olist
 
+## 📑 Sumário
+
+- <a href="#convencoes-do-codigo">Convenções do código</a>
+- <a href="#fluxo-de-uma-consulta">Fluxo de uma consulta</a>
+- <a href="#1-configuracao-vocrag-config-py">1. Configuração: `voc_rag/config.py`</a>
+- <a href="#2-provedores-vocrag-llm-py">2. Provedores: `voc_rag/llm.py`</a>
+- <a href="#3-estruturas-de-dados-vocrag-schemas-py">3. Estruturas de dados: `voc_rag/schemas.py`</a>
+- <a href="#4-preparacao-vocrag-preparation-py">4. Preparação: `voc_rag/preparation.py`</a>
+- <a href="#5-indexacao-vocrag-indexing-py-e-vocrag-vectorstore-py">5. Indexação: `voc_rag/indexing.py` e `voc_rag/vector_store.py`</a>
+- <a href="#6-interpretacao-vocrag-queryanalyzer-py">6. Interpretação: `voc_rag/query_analyzer.py`</a>
+- <a href="#7-busca-lexical-vocrag-lexical-py">7. Busca lexical: `voc_rag/lexical.py`</a>
+- <a href="#8-rerank-vocrag-reranker-py">8. Rerank: `voc_rag/reranker.py`</a>
+- <a href="#9-recuperacao-vocrag-retriever-py">9. Recuperação: `voc_rag/retriever.py`</a>
+- <a href="#10-estatisticas-vocrag-stats-py">10. Estatísticas: `voc_rag/stats.py`</a>
+- <a href="#11-geracao-vocrag-generator-py">11. Geração: `voc_rag/generator.py`</a>
+- <a href="#12-orquestracao-vocrag-pipeline-py">12. Orquestração: `voc_rag/pipeline.py`</a>
+- <a href="#13-avaliacao-vocrag-evaluation-py">13. Avaliação: `voc_rag/evaluation.py`</a>
+- <a href="#14-interface-app-py">14. Interface: `app.py`</a>
+- <a href="#15-linha-de-comando-vocrag-cli-py">15. Linha de comando: `voc_rag/cli.py`</a>
+- <a href="#16-modulos-sem-classes-ou-funcoes-proprias">16. Módulos sem classes ou funções próprias</a>
+- <a href="#17-testes-tests">17. Testes: `tests/`</a>
+- <a href="#18-funcoes-didaticas-dos-notebooks">18. Funções didáticas dos notebooks</a>
+
+
 A aplicação usa os módulos de `voc_rag/` para preparar as avaliações da Olist e responder às perguntas. `app.py` monta o chat; os notebooks mostram a exploração dos dados e as etapas da busca; `tests/` verifica as regras sem chamar a API.
+
+<a id="convencoes-do-codigo"></a>
 
 ## Convenções do código
 
@@ -15,6 +41,8 @@ As classes reúnem os dados e as operações de cada componente. Dentro delas, `
 | `BaseModel` | Definição dos campos e tipos que o Pydantic valida nas entradas estruturadas. |
 | Prefixo `_` | Identificação de métodos auxiliares internos. |
 | Retorno `None` | Ausência de um valor de resultado; a função pode exibir a tela ou gravar um arquivo. |
+
+<a id="fluxo-de-uma-consulta"></a>
 
 ## Fluxo de uma consulta
 
@@ -50,6 +78,8 @@ flowchart TD
 ```
 
 A base analítica inclui as avaliações sem comentário, que continuam contando nas estatísticas. Para a busca, a preparação seleciona os textos que passam no critério de indexação. Com a configuração padrão, uma consulta pode mostrar indicadores de milhares de avaliações e usar até 12 textos distintos (20 em perguntas de panorama) para compor a resposta.
+
+<a id="1-configuracao-vocrag-config-py"></a>
 
 ## 1. Configuração: `voc_rag/config.py`
 
@@ -97,6 +127,8 @@ Fornecem os `Path` de `reviews_analytics.parquet` e `reviews_documents.parquet` 
 
 Leem variáveis de ambiente booleanas (`true`, `1`, `sim`) e numéricas opcionais.
 
+<a id="2-provedores-vocrag-llm-py"></a>
+
 ## 2. Provedores: `voc_rag/llm.py`
 
 [Abrir arquivo](../voc_rag/llm.py)
@@ -116,6 +148,8 @@ Devolve `E5Embeddings`, `OpenAIEmbeddings` ou `GoogleGenerativeAIEmbeddings`, co
 ### Classe `E5Embeddings`
 
 Embeddings locais com `sentence-transformers`. `embed_documents` acrescenta o prefixo `passage: ` e `embed_query`, o prefixo `query: `, como a família E5 exige; os vetores saem normalizados. Outros modelos locais recebem o texto sem prefixo.
+
+<a id="3-estruturas-de-dados-vocrag-schemas-py"></a>
 
 ## 3. Estruturas de dados: `voc_rag/schemas.py`
 
@@ -198,6 +232,8 @@ Reúne os IDs dos achados em um `set[str]`. A interface usa essa propriedade par
 
 Monta o Markdown com pergunta, estado, frases de busca, filtros, avisos, resumo, achados, limitações e a tabela de evidências com similaridade e relevância. Troca `|` por `/` no texto das avaliações para preservar as colunas.
 
+<a id="4-preparacao-vocrag-preparation-py"></a>
+
 ## 4. Preparação: `voc_rag/preparation.py`
 
 [Abrir arquivo](../voc_rag/preparation.py)
@@ -228,6 +264,8 @@ Combina os DataFrames de `tables` (`reviews`, `orders`, `items`, `products` e `c
 - `_prepare_orders(orders, customers)`: calcula `delay_days`, `delivery_status` (`nao_entregue`, `atrasado` ou `no_prazo`), `purchase_month`, `purchase_month_num` e o `state` do cliente.
 - `_main_category(items, products)`: usa a categoria do item de maior preço do pedido.
 - `_report(raw, base)`: monta o relatório com contagens, ausências, taxa de comentário por nota e nota 1 por situação de entrega.
+
+<a id="5-indexacao-vocrag-indexing-py-e-vocrag-vectorstore-py"></a>
 
 ## 5. Indexação: `voc_rag/indexing.py` e `voc_rag/vector_store.py`
 
@@ -260,6 +298,8 @@ Adapta o `langchain_chroma.Chroma` à mesma interface. `to_chroma_filter(filters
 
 Busca um texto e devolve `(texto, metadados, cosseno)` de cada resultado. O notebook do pipeline usa essa função.
 
+<a id="6-interpretacao-vocrag-queryanalyzer-py"></a>
+
 ## 6. Interpretação: `voc_rag/query_analyzer.py`
 
 [Abrir arquivo](../voc_rag/query_analyzer.py)
@@ -286,6 +326,8 @@ Fallback determinístico. Marca a pergunta como dentro do escopo, já que as reg
 - "principais", "padrões" e "recorrentes" marcam a pergunta como panorama e usam os subtemas `NEGATIVE_TOPICS` ou `POSITIVE_TOPICS` como frases de busca; nas outras, a própria pergunta é a frase;
 - lê mês e ano ("novembro de 2017", "em 2018"), situação de entrega ("pedidos entregues com atraso", "não chegou"), categoria e estados (siglas e nomes por extenso).
 
+<a id="7-busca-lexical-vocrag-lexical-py"></a>
+
 ## 7. Busca lexical: `voc_rag/lexical.py`
 
 [Abrir arquivo](../voc_rag/lexical.py)
@@ -304,6 +346,8 @@ Monta o índice BM25 (`rank_bm25.BM25Okapi`) em memória sobre o texto dos docum
 
 Pontua os documentos, zera a pontuação de quem está fora de `filter_mask` e devolve os `review_id` das `k` maiores pontuações positivas.
 
+<a id="8-rerank-vocrag-reranker-py"></a>
+
 ## 8. Rerank: `voc_rag/reranker.py`
 
 [Abrir arquivo](../voc_rag/reranker.py)
@@ -321,6 +365,8 @@ Esquema da saída estruturada do rerank por LLM: uma nota de 0 a 3 para cada ID 
 ### Classe `LLMReranker`
 
 Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada chamada recebe a pergunta original, a descrição do filtro aplicado, a frase de busca e os candidatos numerados. IDs ausentes ou inválidos ficam com nota 0, e notas fora de 0 a 3 são limitadas a esse intervalo. O corte é `min_relevance=2`, e o `score` vale `(nota + similaridade) / 4`: a nota domina e a similaridade desempata.
+
+<a id="9-recuperacao-vocrag-retriever-py"></a>
 
 ## 9. Recuperação: `voc_rag/retriever.py`
 
@@ -363,6 +409,8 @@ Chama `rank` e `_select` e acrescenta ao funil quantas evidências cada frase fo
 
 Divide as `top_k` vagas igualmente entre as frases com candidatos; a sobra da divisão vai para as primeiras frases, então 20 vagas para 6 frases viram 4, 4, 3, 3, 3 e 3. Em cada frase, agrupa textos idênticos, conta os `review_id` agrupados em `occurrences`, ignora textos já escolhidos por outra frase e aplica o MMR. Numera as evidências como `R1`, `R2` e assim por diante. `occurrences` não permite estimar a frequência do texto na base inteira.
 
+<a id="10-estatisticas-vocrag-stats-py"></a>
+
 ## 10. Estatísticas: `voc_rag/stats.py`
 
 [Abrir arquivo](../voc_rag/stats.py)
@@ -386,6 +434,8 @@ Guarda os rótulos em português usados na interface e nas mensagens: `DELIVERY_
 - `format_condition(column, operator, value)`: escreve uma condição de `conditions()` com rótulos, como "Mês da compra >= 2017-11" ou "Estado em RJ, SP".
 - `describe_conditions(filters)`: junta as condições com ponto e vírgula, ou devolve "toda a base".
 
+<a id="11-geracao-vocrag-generator-py"></a>
+
 ## 11. Geração: `voc_rag/generator.py`
 
 [Abrir arquivo](../voc_rag/generator.py)
@@ -403,6 +453,8 @@ Monta um bloco por evidência com o ID, os metadados do pedido (identificados co
 #### `AnswerGenerator.generate(question, evidences, overview)`
 
 Envia ao modelo a pergunta, o panorama e o contexto. Com `llm=None`, a propriedade `available` é falsa e o pipeline não chama o gerador. Depois limpa as citações de cada achado, descarta achados sem citação válida e registra quantos foram descartados em `dropped_insights`. O código confere que os IDs existem, mas não verifica se o texto citado comprova a afirmação; essa conferência é feita na avaliação, pelo juiz.
+
+<a id="12-orquestracao-vocrag-pipeline-py"></a>
 
 ## 12. Orquestração: `voc_rag/pipeline.py`
 
@@ -438,6 +490,8 @@ Falhas na busca ou na geração também devolvem `ERROR`, mantendo a análise e 
 
 Cria o modelo de chat (ou segue sem ele, com um aviso, quando falta a chave de API), lê a base analítica, conecta o banco vetorial e confere o índice, monta o `LexicalIndex` e o reranker de `create_reranker` conforme as chaves de `Settings` e devolve o pipeline.
 
+<a id="13-avaliacao-vocrag-evaluation-py"></a>
+
 ## 13. Avaliação: `voc_rag/evaluation.py`
 
 [Abrir arquivo](../voc_rag/evaluation.py)
@@ -460,6 +514,8 @@ Guarda a análise de cada pergunta e seus tokens, para que todas as configuraç�
 
 `summarize` agrega acurácia por split (média e desvio entre repetições), recusas e respostas indevidas, erros, barreiras, vereditos, insights descartados, tokens e tempo. `to_markdown` gera `docs/avaliacao.md`. `run_evaluation` carrega `examples/eval_set.json`, avisa quando o juiz usa o mesmo provedor do gerador e grava o Markdown e `data/eval/avaliacao.json`.
 
+<a id="14-interface-app-py"></a>
+
 ## 14. Interface: `app.py`
 
 [Abrir arquivo](../app.py)
@@ -480,6 +536,8 @@ As funções de `app.py` montam o chat no Streamlit. No início do arquivo ficam
 | `render_welcome(examples)` | Mostra os indicadores e os cartões iniciais, que usam os exemplos `0`, `1` e `2`. |
 | `main()` | Controla a sessão (`history`, `pending_question`, `failed_question`) e chama `ask(pergunta, recorte, usar_filtros, on_progress=...)` dentro de um `st.status`, que fecha como "Análise concluída em N s" ou como erro. A tela inicial fica em um espaço fixo (`st.empty()`) que permanece vazio durante a análise; sem isso, o Streamlit manteria os cartões da execução anterior esmaecidos na tela até a resposta chegar. Um resultado `ERROR` segue o caminho da falha e oferece "Tentar novamente". |
 
+<a id="15-linha-de-comando-vocrag-cli-py"></a>
+
 ## 15. Linha de comando: `voc_rag/cli.py`
 
 [Abrir arquivo](../voc_rag/cli.py)
@@ -491,6 +549,8 @@ As funções de `app.py` montam o chat no Streamlit. No início do arquivo ficam
 | `ask "pergunta"` | Executa `VoCPipeline.ask()` e imprime o Markdown. |
 | `examples` | Executa `run_examples()`, que roda `examples/questions.json`, confere `expected_status` e `expected_filters` e grava `docs/exemplos.md`. |
 | `evaluate` | Executa `run_evaluation()` com as opções `--judge`, `--repeat`, `--configs`, `--split` e `--skip-retrieval`. |
+
+<a id="16-modulos-sem-classes-ou-funcoes-proprias"></a>
 
 ## 16. Módulos sem classes ou funções próprias
 
@@ -509,11 +569,15 @@ As funções de `app.py` montam o chat no Streamlit. No início do arquivo ficam
 
 O arquivo está vazio e marca `voc_rag` como um pacote Python.
 
+<a id="17-testes-tests"></a>
+
 ## 17. Testes: `tests/`
 
 [Abrir pasta](../tests/)
 
 Rode `python -m unittest discover -s tests -v`. Os testes não chamam a API: `tests/fakes.py` imita o banco vetorial, o BM25 e o rerank, e os testes do FAISS usam um índice real com vetores sintéticos, e os testes do pipeline usam dublês do analisador e do gerador. Eles cobrem filtros e mescla, pré-filtro e `reconstruct` do FAISS, prefixos do E5, lote do cross-encoder, fallback por regras e correspondência de categorias, limpeza e montagem da base com tabelas sintéticas, citações, agrupamento de repetidos, cota por frase, BM25, rerank, panorama e as transições de status.
+
+<a id="18-funcoes-didaticas-dos-notebooks"></a>
 
 ## 18. Funções didáticas dos notebooks
 
