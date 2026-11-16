@@ -16,7 +16,7 @@ from voc_rag.config import ROOT, Settings
 from voc_rag.generator import AnswerGenerator, format_context
 from voc_rag.indexing import check_index, create_vector_store
 from voc_rag.lexical import LexicalIndex
-from voc_rag.llm import create_chat_model
+from voc_rag.llm import create_chat_model, create_chat_model_pair
 from voc_rag.pipeline import VoCPipeline
 from voc_rag.prompts import JUDGE_HUMAN, JUDGE_SYSTEM
 from voc_rag.query_analyzer import QueryAnalyzer
@@ -98,16 +98,29 @@ class CachedAnalyzer:
 class EvaluationRunner:
     def __init__(self, settings: Settings, use_judge: bool):
         self.settings = settings
-        llm = create_chat_model(settings.llm_provider, settings.chat_model, settings.temperature)
+        models = create_chat_model_pair(
+            settings.llm_provider, settings.chat_model, settings.temperature,
+            settings.fallback_chat_model, settings.fallback_provider,
+        )
+        if models.llm is None:
+            raise RuntimeError(
+                "A avaliação precisa de um modelo de chat. Defina a chave do provedor de LLM_PROVIDER "
+                "ou de FALLBACK_PROVIDER no .env."
+            )
+        self.models = models
         self.stats = ReviewStats(pd.read_parquet(settings.analytics_path))
         self.store = create_vector_store(settings)
         check_index(self.store, settings)
         self.lexical = LexicalIndex(pd.read_parquet(settings.documents_path))
         self.reranker = create_reranker(settings)
-        self.analyzer = CachedAnalyzer(QueryAnalyzer(llm, self.stats.categories))
-        self.generator = AnswerGenerator(llm)
+        self.analyzer = CachedAnalyzer(QueryAnalyzer(models.llm, self.stats.categories, models.fallback_llm))
+        self.generator = AnswerGenerator(models.llm, models.fallback_llm)
         self.judge = None
         if use_judge:
+            if not settings.judge_model:
+                raise RuntimeError(
+                    f"Defina JUDGE_MODEL no .env: JUDGE_PROVIDER={settings.judge_provider} não tem um modelo para herdar."
+                )
             judge_llm = create_chat_model(settings.judge_provider, settings.judge_model, settings.temperature)
             prompt = ChatPromptTemplate.from_messages([("system", JUDGE_SYSTEM), ("human", JUDGE_HUMAN)])
             self.judge = prompt | judge_llm.with_structured_output(Verdicts)
@@ -174,6 +187,7 @@ class EvaluationRunner:
             "correct": is_correct(item["expected"], result.status), "stopped_at": result.trace.get("stopped_at"),
             "evidences": len(result.evidences), "cited": len(result.cited_ids), "insights": len(result.insights),
             "dropped_insights": result.trace.get("dropped_insights", 0),
+            "fallback_models": result.trace.get("fallback_models", []),
             "search_queries": result.analysis.search_queries if result.analysis else [],
             "conditions": [list(condition) for condition in result.filters.conditions()] if result.filters else [],
             "filters_ok": None,
@@ -207,6 +221,7 @@ def summarize(records: list[dict], configs: list[str]) -> dict:
         item["false_refusals"] = sum(row["expected"] == "answer" and row["status"] != Status.ANSWERED.value for row in rows)
         item["false_answers"] = sum(row["expected"] == "refuse" and row["status"] == Status.ANSWERED.value for row in rows)
         item["errors"] = sum(row["status"] == Status.ERROR.value for row in rows)
+        item["fallbacks"] = sum(bool(row.get("fallback_models")) for row in rows)
         item["gates"] = dict(Counter(row["stopped_at"] for row in rows if row["stopped_at"]))
         verdicts = [verdict for row in rows for verdict in row.get("verdicts", [])]
         item["verdicts"] = dict(Counter(verdict["supported"] for verdict in verdicts))
@@ -234,7 +249,9 @@ def to_markdown(report: dict) -> str:
         f"Gerado em {meta['date']} pelo comando `python -m voc_rag.cli evaluate`. "
         f"Repetições: {meta['repeat']}. Juiz: {meta['judge'] or 'não usado'}.", "",
         "| Item | Valor |", "|---|---|",
-        f"| Modelo de chat | `{meta['llm']}` |", f"| Modelo do rerank | `{meta['rerank']}` |",
+        f"| Modelo de chat | `{meta['llm']}` |",
+        f"| Modelo reserva | {'`' + meta['fallback'] + '`' if meta.get('fallback') else 'não configurado'} |",
+        f"| Modelo do rerank | `{meta['rerank']}` |",
         f"| Embeddings | `{meta['embeddings']}` |", f"| Banco vetorial | `{meta.get('vector_store', 'chroma')}` |",
         f"| Similaridade mínima | {meta['min_similarity']} |",
         f"| Corte do rerank | {meta['min_relevance']} |", "",
@@ -269,6 +286,9 @@ def to_markdown(report: dict) -> str:
             f"| {item['false_answers']} | {item['errors']} | {gates} | {item['input_tokens']:.0f} / {item['output_tokens']:.0f} "
             f"| {item['seconds']:.1f} |"
         )
+    fallbacks = [f"`{config}`: {summary[config].get('fallbacks', 0)}" for config in configs]
+    if any(summary[config].get("fallbacks") for config in configs):
+        lines += ["", "Respostas em que o modelo reserva foi acionado: " + ", ".join(fallbacks) + "."]
     analysis = summary["analysis_tokens"]
     lines += [
         "", f"A análise da pergunta, comum a todas as configurações, usa em média {analysis['input']:.0f} tokens de entrada "
@@ -325,7 +345,9 @@ def run_evaluation(
     report = {
         "meta": {
             "date": date.today().isoformat(), "repeat": repeat, "split": split,
-            "llm": f"{settings.llm_provider}:{settings.chat_model}", "rerank": runner.reranker.model and f"{runner.reranker.name}:{runner.reranker.model}",
+            "llm": runner.models.replaced_primary or f"{settings.llm_provider}:{settings.chat_model}",
+            "fallback": f"{settings.fallback_provider}:{settings.fallback_chat_model}" if runner.models.fallback_llm else None,
+            "rerank": runner.reranker.model and f"{runner.reranker.name}:{runner.reranker.model}",
             "judge": f"{settings.judge_provider}:{settings.judge_model}" if use_judge else None, "judge_warning": judge_warning,
             "embeddings": f"{settings.embedding_provider}:{settings.embedding_model}",
             "min_similarity": settings.min_similarity, "min_relevance": runner.reranker.min_score,

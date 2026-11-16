@@ -19,10 +19,20 @@ DEFAULT_MIN_SIMILARITY = {"local": 0.80, "openai": 0.40, "google": 0.40}
 DEFAULT_CROSS_ENCODER = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
 VECTOR_STORES = {"faiss", "chroma"}
 RERANKERS = {"cross_encoder", "llm"}
+LLM_PROVIDERS = {"openai", "google"}
+DISABLED = {"", "none", "nenhum", "false", "0"}
 
 
 def env_flag(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "sim", "yes"}
+
+
+def env_text(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def env_provider(name: str, default: str = "") -> str:
+    return env_text(name, default).lower()
 
 
 def env_float(name: str, default: float | None = None) -> float | None:
@@ -37,12 +47,13 @@ class Settings:
     chroma_dir: Path = ROOT / "data" / "chroma"
     faiss_dir: Path = ROOT / "data" / "faiss"
     eval_dir: Path = ROOT / "data" / "eval"
-    llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "openai"))
-    chat_model: str = field(default_factory=lambda: os.getenv("CHAT_MODEL", "gpt-5.6-luna"))
-    fallback_chat_model: str = field(default_factory=lambda: os.getenv("FALLBACK_CHAT_MODEL", "gemini-3.5-flash-lite"))
-    rerank_model: str = field(default_factory=lambda: os.getenv("RERANK_MODEL", ""))
-    judge_provider: str = field(default_factory=lambda: os.getenv("JUDGE_PROVIDER", ""))
-    judge_model: str = field(default_factory=lambda: os.getenv("JUDGE_MODEL", ""))
+    llm_provider: str = field(default_factory=lambda: env_provider("LLM_PROVIDER", "openai"))
+    chat_model: str = field(default_factory=lambda: env_text("CHAT_MODEL", "gpt-5.6-luna"))
+    fallback_provider: str = field(default_factory=lambda: env_provider("FALLBACK_PROVIDER", "google"))
+    fallback_chat_model: str = field(default_factory=lambda: env_text("FALLBACK_CHAT_MODEL", "gemini-3.5-flash-lite"))
+    rerank_model: str = field(default_factory=lambda: env_text("RERANK_MODEL"))
+    judge_provider: str = field(default_factory=lambda: env_provider("JUDGE_PROVIDER"))
+    judge_model: str = field(default_factory=lambda: env_text("JUDGE_MODEL"))
     temperature: float | None = field(default_factory=lambda: env_float("LLM_TEMPERATURE"))
     embedding_provider: str = field(default_factory=lambda: os.getenv("EMBEDDING_PROVIDER", "local"))
     embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", ""))
@@ -67,6 +78,15 @@ class Settings:
     min_evidences: int = 3
 
     def __post_init__(self):
+        providers = ", ".join(sorted(LLM_PROVIDERS))
+        if self.llm_provider not in LLM_PROVIDERS:
+            raise ValueError(f"LLM_PROVIDER desconhecido: {self.llm_provider}. Use {providers}.")
+        if self.fallback_provider in DISABLED or not self.fallback_chat_model:
+            object.__setattr__(self, "fallback_provider", "")
+        elif self.fallback_provider not in LLM_PROVIDERS:
+            raise ValueError(f"FALLBACK_PROVIDER desconhecido: {self.fallback_provider}. Use {providers} ou none.")
+        if self.judge_provider and self.judge_provider not in LLM_PROVIDERS:
+            raise ValueError(f"JUDGE_PROVIDER desconhecido: {self.judge_provider}. Use {providers}.")
         if self.embedding_provider not in DEFAULT_EMBEDDING_MODELS:
             raise ValueError(f"EMBEDDING_PROVIDER desconhecido: {self.embedding_provider}. Use {', '.join(DEFAULT_EMBEDDING_MODELS)}.")
         if self.vector_store not in VECTOR_STORES:
@@ -83,7 +103,10 @@ class Settings:
         if not self.judge_provider:
             object.__setattr__(self, "judge_provider", self.llm_provider)
         if not self.judge_model:
-            object.__setattr__(self, "judge_model", self.chat_model)
+            if self.judge_provider == self.llm_provider:
+                object.__setattr__(self, "judge_model", self.chat_model)
+            elif self.judge_provider == self.fallback_provider:
+                object.__setattr__(self, "judge_model", self.fallback_chat_model)
 
     @property
     def collection_name(self) -> str:

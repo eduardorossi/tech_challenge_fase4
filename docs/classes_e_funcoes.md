@@ -94,10 +94,11 @@ Guarda os caminhos dos arquivos, os provedores, os modelos e os parâmetros da b
 | `raw_dir`, `processed_dir`, `chroma_dir`, `faiss_dir`, `eval_dir` | pastas em `ROOT / "data"` | CSVs de origem, Parquet preparados, bancos vetoriais e saída da avaliação. |
 | `llm_provider` | `LLM_PROVIDER` ou `openai` | Provedor do chat: `openai` ou `google`. |
 | `chat_model` | `CHAT_MODEL` ou `gpt-5.6-luna` | Modelo que analisa a pergunta e gera a resposta. |
+| `fallback_provider`, `fallback_chat_model` | `FALLBACK_PROVIDER` ou `google`, `FALLBACK_CHAT_MODEL` ou `gemini-3.5-flash-lite` | Modelo reserva, chamado quando o principal falha ou não tem chave. `none` (ou modelo vazio) desliga e deixa `fallback_provider` vazio. |
 | `reranker` | `RERANKER` ou `cross_encoder` | `cross_encoder` (local) ou `llm`. |
 | `cross_encoder_model` | `CROSS_ENCODER_MODEL` ou `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder multilíngue do rerank local. |
 | `rerank_model` | `RERANK_MODEL` ou o `chat_model` | Modelo que dá as notas de relevância com `RERANKER=llm`; use um modelo barato. |
-| `judge_provider`, `judge_model` | `JUDGE_PROVIDER` e `JUDGE_MODEL`, ou os do chat | Juiz da avaliação de fundamentação. |
+| `judge_provider`, `judge_model` | `JUDGE_PROVIDER` e `JUDGE_MODEL`, ou os do chat | Juiz da avaliação de fundamentação. O modelo herdado acompanha o provedor: o do chat, o reserva ou vazio (a avaliação com `--judge` pede `JUDGE_MODEL`). |
 | `temperature` | `LLM_TEMPERATURE` ou `None` | Só é enviada quando definida; modelos de raciocínio recusam o parâmetro. |
 | `embedding_provider` | `EMBEDDING_PROVIDER` ou `local` | Provedor dos embeddings: `local`, `openai` ou `google`. |
 | `embedding_model` | `EMBEDDING_MODEL` ou o padrão do provedor | `intfloat/multilingual-e5-small` (local), `text-embedding-3-small` (OpenAI) ou `gemini-embedding-2-preview` (Google). |
@@ -113,7 +114,7 @@ Guarda os caminhos dos arquivos, os provedores, os modelos e os parâmetros da b
 | `top_k`, `overview_top_k` | `12`, `20` | Máximo de evidências em perguntas específicas e de panorama. |
 | `min_evidences` | `3` | Mínimo de evidências para chamar o gerador. |
 
-O construtor consulta as variáveis de ambiente ao criar a instância, e `__post_init__` valida `embedding_provider`, `vector_store` e `reranker` e preenche os campos vazios que herdam outro valor. Para alterar um valor em código, passe o campo na chamada, como `Settings(top_k=8)`, ou use `dataclasses.replace(settings, use_rerank=False)`.
+O construtor consulta as variáveis de ambiente ao criar a instância, e `__post_init__` valida `llm_provider`, `fallback_provider`, `judge_provider`, `embedding_provider`, `vector_store` e `reranker` (um valor como `LLM_PROVIDER=gemini` gera um `ValueError` com as opções aceitas) e preenche os campos vazios que herdam outro valor. Para alterar um valor em código, passe o campo na chamada, como `Settings(top_k=8)`, ou use `dataclasses.replace(settings, use_rerank=False)`.
 
 #### `Settings.collection_name`
 
@@ -133,13 +134,25 @@ Leem variáveis de ambiente booleanas (`true`, `1`, `sim`) e numéricas opcionai
 
 [Abrir arquivo](../voc_rag/llm.py)
 
-### Função `require_api_key(provider)`
+### Funções `configured_api_key(provider)` e `require_api_key(provider)`
 
-Confere se o `.env` tem a chave do provedor (`OPENAI_API_KEY`, ou `GOOGLE_API_KEY`/`GEMINI_API_KEY`) e levanta um erro com a variável que falta.
+`configured_api_key` devolve a primeira chave do provedor (`OPENAI_API_KEY`, ou `GOOGLE_API_KEY`/`GEMINI_API_KEY`) que não está vazia nem com um valor de exemplo de `PLACEHOLDER_KEYS`, como o `sua-chave-aqui`. `require_api_key` devolve essa chave ou levanta `RuntimeError` com a variável que falta; um provedor desconhecido gera `ValueError`.
 
 ### Função `create_chat_model(provider, model, temperature=None)`
 
-Cria o modelo de chat com `init_chat_model` do LangChain. Envia `temperature` só quando o valor é informado.
+Cria o modelo de chat com `init_chat_model` do LangChain e passa a chave validada em `api_key`, para que um `GOOGLE_API_KEY` de exemplo não encubra um `GEMINI_API_KEY` válido. Envia `temperature` só quando o valor é informado.
+
+### Função `create_chat_model_pair(provider, model, temperature=None, fallback_model=None, fallback_provider="google")`
+
+Cria o modelo principal e o reserva e devolve um `ChatModels(llm, fallback_llm, replaced_primary)`. Sem chave do principal, o reserva ocupa o lugar dele e `replaced_primary` guarda o `provedor:modelo` que assumiu; sem nenhuma chave, devolve `ChatModels(None, None)`. Um reserva igual ao principal, ou com `fallback_provider` vazio, não é criado. É usada pelo pipeline, pelo rerank por LLM e pela avaliação.
+
+### Função `structured_output_with_fallback(llm, schema, fallback_llm=None)`
+
+Configura a saída estruturada no `schema`. Com reserva, chama o principal e, se ele levantar qualquer exceção, registra no log o modelo, o tipo e a mensagem do erro e repete a chamada no reserva (também em `ainvoke` e em `batch`). Se o reserva também falhar, a exceção dele sobe para quem chamou. O código não usa o `with_fallbacks` do LangChain porque ele descarta o motivo da falha do principal.
+
+### Funções `track_fallbacks()` e `record_fallback(label)`
+
+`track_fallbacks` é um gerenciador de contexto que coleta, em uma `ContextVar`, os modelos reservas acionados dentro do bloco; `record_fallback` acrescenta um modelo a essa lista. O pipeline abre um bloco por pergunta, e a `ContextVar` mantém as consultas de sessões simultâneas do Streamlit separadas.
 
 ### Função `create_embeddings(settings)`
 
@@ -224,6 +237,10 @@ Reúne o resultado de `VoCPipeline.ask()`. Além da pergunta, do status, do resu
 - `notices`: avisos ao usuário, como a substituição de um filtro;
 - `trace`: o funil de cada frase de busca, a barreira que recusou (`stopped_at`), os tempos por etapa e os tokens por modelo.
 
+#### `PipelineResult.failed`
+
+Verdadeiro para um `ERROR` real. O `ERROR` da barreira `no_llm` (sem modelo de chat) não conta como falha: a interface mostra o aviso e as evidências recuperadas.
+
 #### `PipelineResult.cited_ids`
 
 Reúne os IDs dos achados em um `set[str]`. A interface usa essa propriedade para marcar as avaliações citadas.
@@ -306,13 +323,13 @@ Busca um texto e devolve `(texto, metadados, cosseno)` de cada resultado. O note
 
 ### Classe `QueryAnalyzer`
 
-#### `QueryAnalyzer.__init__(llm, categories)`
+#### `QueryAnalyzer.__init__(llm, categories, fallback_llm=None)`
 
-Monta o prompt com `ANALYZER_SYSTEM` e a lista de categorias e configura o `llm` para devolver um `QueryAnalysis`. Com `llm=None` (sem chave de API), toda análise usa as regras.
+Monta o prompt com `ANALYZER_SYSTEM` e a lista de categorias e configura o `llm` para devolver um `QueryAnalysis`, com o `fallback_llm` como reserva via `structured_output_with_fallback` (o mesmo reserva do gerador). Com `llm=None` (sem chave de API), toda análise usa as regras.
 
 #### `QueryAnalyzer.analyze(question, manual_filters=None)`
 
-Envia a pergunta e, quando houver, o recorte manual descrito por `describe_filters`. Se a chamada falhar, registra um aviso e devolve `rules_analysis`. Depois aproxima a categoria da grafia da base com `CategoryMatcher` (e a anula se nada for parecido), remove frases de busca vazias ou repetidas, limita a lista a `MAX_SEARCH_QUERIES=6` e usa a própria pergunta se não sobrar nenhuma frase.
+Envia a pergunta e, quando houver, o recorte manual descrito por `describe_filters`. Se o principal e o reserva falharem, registra um aviso com o tipo e a mensagem do erro e devolve `rules_analysis`. Depois aproxima a categoria da grafia da base com `CategoryMatcher` (e a anula se nada for parecido), remove frases de busca vazias ou repetidas, limita a lista a `MAX_SEARCH_QUERIES=6` e usa a própria pergunta se não sobrar nenhuma frase.
 
 ### Classe `CategoryMatcher`
 
@@ -364,7 +381,7 @@ Esquema da saída estruturada do rerank por LLM: uma nota de 0 a 3 para cada ID 
 
 ### Classe `LLMReranker`
 
-Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada chamada recebe a pergunta original, a descrição do filtro aplicado, a frase de busca e os candidatos numerados. IDs ausentes ou inválidos ficam com nota 0, e notas fora de 0 a 3 são limitadas a esse intervalo. O corte é `min_relevance=2`, e o `score` vale `(nota + similaridade) / 4`: a nota domina e a similaridade desempata.
+Recebe o modelo do rerank e, opcionalmente, o reserva (`fallback_llm`), criados por `create_reranker` com `create_chat_model_pair`; sem nenhum modelo, `create_reranker` levanta um erro que sugere `RERANKER=cross_encoder`. Faz uma chamada por frase de busca, todas em paralelo com `chain.batch`. Cada chamada recebe a pergunta original, a descrição do filtro aplicado, a frase de busca e os candidatos numerados. IDs ausentes ou inválidos ficam com nota 0, e notas fora de 0 a 3 são limitadas a esse intervalo. O corte é `min_relevance=2`, e o `score` vale `(nota + similaridade) / 4`: a nota domina e a similaridade desempata.
 
 <a id="9-recuperacao-vocrag-retriever-py"></a>
 
@@ -450,6 +467,8 @@ Monta um bloco por evidência com o ID, os metadados do pedido (identificados co
 
 ### Classe `AnswerGenerator`
 
+O construtor recebe `llm` e, opcionalmente, o reserva `fallback_llm`, ligados por `structured_output_with_fallback`.
+
 #### `AnswerGenerator.generate(question, evidences, overview)`
 
 Envia ao modelo a pergunta, o panorama e o contexto. Com `llm=None`, a propriedade `available` é falsa e o pipeline não chama o gerador. Depois limpa as citações de cada achado, descarta achados sem citação válida e registra quantos foram descartados em `dropped_insights`. O código confere que os IDs existem, mas não verifica se o texto citado comprova a afirmação; essa conferência é feita na avaliação, pelo juiz.
@@ -466,13 +485,13 @@ Diz qual barreira recusou uma pergunta com poucas evidências, quando o recorte 
 
 ### Classe `VoCPipeline`
 
-#### `VoCPipeline.__init__(analyzer, retriever, generator, stats, settings)`
+#### `VoCPipeline.__init__(analyzer, retriever, generator, stats, settings, notices=None)`
 
-Recebe os componentes prontos, o que permite substituí-los nos testes e na avaliação.
+Recebe os componentes prontos, o que permite substituí-los nos testes e na avaliação. `notices` são avisos fixos da configuração, como `PRIMARY_REPLACED_NOTICE`, que abrem a lista de avisos de toda resposta.
 
 #### `VoCPipeline.ask(question, manual_filters=None, use_filters=True, on_progress=None)`
 
-Processa a pergunta e devolve um `PipelineResult`, registrando os tokens de cada modelo e o tempo total no `trace`. O `on_progress` opcional, do tipo `ProgressCallback`, recebe o nome de cada etapa concluída e os dados dela: `analyzed` (tipo da pergunta, frases de busca e filtro), `candidates` (total de candidatos e se o rerank vem a seguir, enviado pelo retriever) e `retrieved` (evidências selecionadas e se bastam para responder). A interface usa esses eventos para mostrar o progresso.
+Processa a pergunta e devolve um `PipelineResult`, registrando os tokens de cada modelo e o tempo total no `trace`. Dentro de `track_fallbacks`, registra em `trace["fallback_models"]` os modelos reservas acionados e, se houver algum, acrescenta `FALLBACK_NOTICE` aos avisos. O `on_progress` opcional, do tipo `ProgressCallback`, recebe o nome de cada etapa concluída e os dados dela: `analyzed` (tipo da pergunta, frases de busca e filtro), `candidates` (total de candidatos e se o rerank vem a seguir, enviado pelo retriever) e `retrieved` (evidências selecionadas e se bastam para responder). A interface usa esses eventos para mostrar o progresso.
 
 1. Interpreta a pergunta com `analyzer.analyze()`, enviando o recorte manual. Se o LLM falhar, o analisador usa as regras; o pipeline registra `analysis_source` no `trace` e acrescenta `RULES_NOTICE` aos avisos. Só uma exceção do próprio analisador devolve `ERROR`.
 2. Se estiver fora do escopo, devolve `OUT_OF_SCOPE` sem buscar.
@@ -488,7 +507,7 @@ Falhas na busca ou na geração também devolvem `ERROR`, mantendo a análise e 
 
 ### Função `build_pipeline(settings=None)`
 
-Cria o modelo de chat (ou segue sem ele, com um aviso, quando falta a chave de API), lê a base analítica, conecta o banco vetorial e confere o índice, monta o `LexicalIndex` e o reranker de `create_reranker` conforme as chaves de `Settings` e devolve o pipeline.
+Cria o modelo principal e o reserva com `create_chat_model_pair` e entrega os dois ao `QueryAnalyzer` e ao `AnswerGenerator` (ou segue sem modelo, com um aviso no log, quando nenhum tem chave; quando o reserva substitui o principal, a resposta traz `PRIMARY_REPLACED_NOTICE`), lê a base analítica, conecta o banco vetorial e confere o índice, monta o `LexicalIndex` e o reranker de `create_reranker` conforme as chaves de `Settings` e devolve o pipeline.
 
 <a id="13-avaliacao-vocrag-evaluation-py"></a>
 
@@ -531,10 +550,10 @@ As funções de `app.py` montam o chat no Streamlit. No início do arquivo ficam
 | `AnalysisProgress` | Recebe os eventos de `on_progress` e atualiza o `st.status` da análise em andamento: escreve as frases de busca, o recorte, os candidatos e as evidências e troca o título pela etapa atual. |
 | `render_filters(busy)` | Mostra a chave "Usar filtros de metadados" e os campos de nota, entrega, categoria, mês e estado; durante a análise, avisa que o recorte está travado. Devolve o `ReviewFilters` manual (ou `None`) e a chave. |
 | `evidence_table(result)` | Monta a tabela de avaliações com citação, nota, estado, categoria, entrega, mês, repetições, similaridade, relevância e frase de busca. |
-| `render(result, index)` | Mostra avisos, resposta ou recusa e as abas "Avaliações", "Panorama do recorte" e "Como chegamos à resposta", esta com filtros, frases de busca, funil, tempo e tokens. |
+| `render(result, index)` | Mostra avisos, resposta, recusa ou, sem modelo de chat (`no_llm`), o aviso de síntese indisponível, e as abas "Avaliações", "Panorama do recorte" e "Como chegamos à resposta", esta com filtros, frases de busca, funil, tempo e tokens. |
 | `render_sidebar(examples, busy)` | Monta a barra lateral com nova conversa, exemplos e recorte; devolve a pergunta escolhida, o recorte e a chave de filtros. |
 | `render_welcome(examples)` | Mostra os indicadores e os cartões iniciais, que usam os exemplos `0`, `1` e `2`. |
-| `main()` | Controla a sessão (`history`, `pending_question`, `failed_question`) e chama `ask(pergunta, recorte, usar_filtros, on_progress=...)` dentro de um `st.status`, que fecha como "Análise concluída em N s" ou como erro. A tela inicial fica em um espaço fixo (`st.empty()`) que permanece vazio durante a análise; sem isso, o Streamlit manteria os cartões da execução anterior esmaecidos na tela até a resposta chegar. Um resultado `ERROR` segue o caminho da falha e oferece "Tentar novamente". |
+| `main()` | Controla a sessão (`history`, `pending_question`, `failed_question`) e chama `ask(pergunta, recorte, usar_filtros, on_progress=...)` dentro de um `st.status`, que fecha como "Análise concluída em N s" ou como erro. A tela inicial fica em um espaço fixo (`st.empty()`) que permanece vazio durante a análise; sem isso, o Streamlit manteria os cartões da execução anterior esmaecidos na tela até a resposta chegar. Um resultado com `failed` verdadeiro segue o caminho da falha e oferece "Tentar novamente"; o `ERROR` de `no_llm` entra no histórico com as evidências. Se o próprio pipeline não puder ser montado (configuração inválida, índice ausente), a tela mostra o motivo em `failed_reason`. |
 
 <a id="15-linha-de-comando-vocrag-cli-py"></a>
 
@@ -564,6 +583,7 @@ As funções de `app.py` montam o chat no Streamlit. No início do arquivo ficam
 - `JUDGE_SYSTEM` e `JUDGE_HUMAN`: auditoria dos achados na avaliação.
 - `OUT_OF_SCOPE_MESSAGE`, `INSUFFICIENT_MESSAGE`, `EMPTY_FILTER_MESSAGE` e `ERROR_MESSAGE`: respostas padronizadas.
 - `FILTER_FIELD_LABELS` e `OVERRIDE_NOTICE`: aviso de substituição de filtro.
+- `RULES_NOTICE`, `FALLBACK_NOTICE` e `PRIMARY_REPLACED_NOTICE`: avisos de análise por regras, de uso do modelo reserva em alguma etapa e de reserva no lugar de um principal sem chave.
 
 ### `voc_rag/__init__.py`
 
@@ -575,7 +595,7 @@ O arquivo está vazio e marca `voc_rag` como um pacote Python.
 
 [Abrir pasta](../tests/)
 
-Rode `python -m unittest discover -s tests -v`. Os testes não chamam a API: `tests/fakes.py` imita o banco vetorial, o BM25 e o rerank, e os testes do FAISS usam um índice real com vetores sintéticos, e os testes do pipeline usam dublês do analisador e do gerador. Eles cobrem filtros e mescla, pré-filtro e `reconstruct` do FAISS, prefixos do E5, lote do cross-encoder, fallback por regras e correspondência de categorias, limpeza e montagem da base com tabelas sintéticas, citações, agrupamento de repetidos, cota por frase, BM25, rerank, panorama e as transições de status.
+Rode `python -m unittest discover -s tests -v`. Os testes não chamam a API: `tests/fakes.py` imita o banco vetorial, o BM25 e o rerank, e os testes do FAISS usam um índice real com vetores sintéticos, e os testes do pipeline usam dublês do analisador e do gerador. Eles cobrem filtros e mescla, pré-filtro e `reconstruct` do FAISS, prefixos do E5, lote do cross-encoder, fallback por regras e correspondência de categorias, limpeza e montagem da base com tabelas sintéticas, citações, agrupamento de repetidos, cota por frase, BM25, rerank, panorama e as transições de status. `tests/test_llm.py` usa `StubChatModel` (em `tests/fakes.py`) e cobre a validação das chaves (incluindo o valor de exemplo), as combinações de principal e reserva, o modelo reserva na análise, na geração e no rerank e a validação dos provedores no `Settings`. `BuildPipelineTest` monta o pipeline real com dublês só do disco e da API, para pegar erros de ligação entre as classes.
 
 <a id="18-funcoes-didaticas-dos-notebooks"></a>
 

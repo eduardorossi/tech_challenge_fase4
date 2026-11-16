@@ -128,6 +128,10 @@ class PipelineResult:
     trace: dict = field(default_factory=dict)
 
     @property
+    def failed(self) -> bool:
+        return self.status == Status.ERROR and self.trace.get("stopped_at") != "no_llm"
+
+    @property
     def cited_ids(self) -> set[str]:
         return {evidence_id for insight in self.insights for evidence_id in insight.evidence_ids}
 

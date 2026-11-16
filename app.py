@@ -193,6 +193,9 @@ def render(result: PipelineResult, index: int) -> None:
     elif result.status == Status.OUT_OF_SCOPE:
         st.info(result.summary)
         st.caption("Experimente perguntar sobre produtos, entregas ou atendimento.")
+    elif result.trace.get("stopped_at") == "no_llm":
+        st.warning(result.summary)
+        st.caption("Configure a chave de API no arquivo .env e reinicie o Streamlit para receber a análise escrita.")
     else:
         st.markdown(result.summary)
         if result.trace.get("stopped_at") != "empty_filter":
@@ -274,6 +277,7 @@ def render_sidebar(examples: list[dict], busy: bool = False) -> tuple[str | None
         )):
             st.session_state.history = []
             st.session_state.pop("failed_question", None)
+            st.session_state.pop("failed_reason", None)
             st.rerun()
         st.divider()
         st.markdown("#### Explore uma pergunta")
@@ -350,7 +354,7 @@ def main() -> None:
             render(past, index)
 
     if failed_question := st.session_state.get("failed_question"):
-        st.error("Não foi possível concluir a análise. Tente novamente em instantes.")
+        st.error(st.session_state.get("failed_reason") or "Não foi possível concluir a análise. Tente novamente em instantes.")
         st.write(f"Pergunta: {failed_question}")
         if st.button("Tentar novamente", disabled=busy):
             question = failed_question
@@ -370,21 +374,28 @@ def main() -> None:
         with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
             status = st.status("Preparando a análise…", expanded=True)
             status.caption("Costuma levar de 10 a 20 segundos.")
+            starting = True
             try:
                 pipeline = get_pipeline()
+                starting = False
                 status.update(label="Entendendo a pergunta…", expanded=True)
                 result = pipeline.ask(
                     pending_question, manual_filters, use_filters, on_progress=AnalysisProgress(status).update
                 )
-                if result.status == Status.ERROR:
+                if result.failed:
                     raise RuntimeError(result.summary)
-            except Exception:
+            except Exception as error:
                 logging.getLogger(__name__).exception("Falha ao consultar o pipeline de avaliações")
                 st.session_state.failed_question = pending_question
+                st.session_state.failed_reason = (
+                    f"O pipeline não pôde ser iniciado: {error} Corrija a configuração e reinicie o Streamlit."
+                    if starting else None
+                )
                 status.update(label="A análise não foi concluída", state="error", expanded=False)
             else:
                 st.session_state.history.append(result)
                 st.session_state.pop("failed_question", None)
+                st.session_state.pop("failed_reason", None)
                 total = result.trace.get("timings_s", {}).get("total", 0)
                 status.update(label=f"Análise concluída em {total:.0f} s", state="complete", expanded=False)
             finally:

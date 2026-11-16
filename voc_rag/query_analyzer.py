@@ -5,6 +5,7 @@ import re
 from langchain_core.prompts import ChatPromptTemplate
 
 from voc_rag.lexical import strip_accents
+from voc_rag.llm import structured_output_with_fallback
 from voc_rag.prompts import ANALYZER_SYSTEM
 from voc_rag.retriever import describe_filters
 from voc_rag.schemas import QueryAnalysis, ReviewFilters
@@ -115,13 +116,13 @@ def rules_analysis(question: str, categories: CategoryMatcher) -> QueryAnalysis:
 
 
 class QueryAnalyzer:
-    def __init__(self, llm, categories: list[str]):
+    def __init__(self, llm, categories: list[str], fallback_llm=None):
         self.categories = CategoryMatcher(categories)
         self.chain = None
         if llm is not None:
             prompt = ChatPromptTemplate.from_messages([("system", ANALYZER_SYSTEM), ("human", "{question}")])
             prompt = prompt.partial(categories=", ".join(categories))
-            self.chain = prompt | llm.with_structured_output(QueryAnalysis)
+            self.chain = prompt | structured_output_with_fallback(llm, QueryAnalysis, fallback_llm)
 
     def analyze(self, question: str, manual_filters: ReviewFilters | None = None) -> QueryAnalysis:
         if self.chain is None:
@@ -130,7 +131,7 @@ class QueryAnalyzer:
         try:
             analysis = self.chain.invoke({"question": question, "manual_filters": manual})
         except Exception as error:
-            logger.warning("Análise por LLM falhou (%s); usando regras.", type(error).__name__)
+            logger.warning("Análise por LLM falhou (%s: %s); usando regras.", type(error).__name__, error)
             return rules_analysis(question, self.categories)
         analysis.filters.category = self.categories.match(analysis.filters.category)
         queries = [query.strip() for query in analysis.search_queries if query.strip()]

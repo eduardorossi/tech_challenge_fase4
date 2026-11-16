@@ -103,7 +103,7 @@ flowchart TD
 
 ## 🛠 Tecnologias
 
-- Python 3.11 ou superior
+- Python 3.12 (exigido pelo `pyproject.toml` e testado com o PyTorch 2.5.1 fixado no `requirements.txt`)
 - LangChain (`langchain`, `langchain-core`, `langchain-openai`, `langchain-google-genai` e `langchain-chroma`), com `init_chat_model` para trocar de provedor pelo `.env`
 - OpenAI ou Google Gemini por API para análise da pergunta, geração e juiz da avaliação (e, opcionalmente, embeddings e rerank)
 - `sentence-transformers` com PyTorch CPU para os modelos locais: embeddings `intfloat/multilingual-e5-small` e reranker `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1`. Não precisam de GPU
@@ -193,7 +193,7 @@ Com `VECTOR_STORE=chroma`, o projeto usa o Chroma local em `data/chroma`, com um
 
 ## 🔄 Pipeline RAG
 
-1. **Transformação da pergunta.** O `QueryAnalyzer` faz uma chamada ao LLM com saída estruturada no esquema `QueryAnalysis`. O modelo informa se a pergunta está no escopo, se ela pede um panorama ("quais os principais problemas?") ou trata de um assunto específico, escreve as frases de busca e preenche os filtros. As frases são escritas como um cliente escreveria na avaliação: de 4 a 6 em perguntas de panorama, uma por subtema provável, e 1 ou 2 em perguntas específicas. Uma pergunta abstrata sobre "problemas" fica longe, no espaço vetorial, de uma avaliação que diz "o produto não chegou"; as frases concretas encurtam essa distância. O código aproxima a categoria escrita pelo modelo da grafia da base com `difflib` ("cama, mesa e banho" vira `cama_mesa_banho`) e descarta o que não se parece com nenhuma categoria. Se o LLM falhar (sem chave, sem cota, timeout), a análise cai em regras determinísticas: palavras como "insatisfeitos" e "elogios" definem a faixa de nota e os subtemas ("reclamações" muda só os subtemas), "principais" e "padrões" marcam a pergunta como panorama, e mês, ano, estado, categoria e situação de entrega são lidos por expressões regulares. A resposta avisa que o escopo não foi verificado.
+1. **Transformação da pergunta.** O `QueryAnalyzer` faz uma chamada ao LLM com saída estruturada no esquema `QueryAnalysis`. O modelo informa se a pergunta está no escopo, se ela pede um panorama ("quais os principais problemas?") ou trata de um assunto específico, escreve as frases de busca e preenche os filtros. As frases são escritas como um cliente escreveria na avaliação: de 4 a 6 em perguntas de panorama, uma por subtema provável, e 1 ou 2 em perguntas específicas. Uma pergunta abstrata sobre "problemas" fica longe, no espaço vetorial, de uma avaliação que diz "o produto não chegou"; as frases concretas encurtam essa distância. O código aproxima a categoria escrita pelo modelo da grafia da base com `difflib` ("cama, mesa e banho" vira `cama_mesa_banho`) e descarta o que não se parece com nenhuma categoria. Se o LLM falhar (sem chave, sem cota, timeout), a análise cai em regras determinísticas: palavras como "insatisfeitos" e "elogios" definem a faixa de nota e os subtemas ("reclamações" muda só os subtemas), "principais" e "padrões" marcam a pergunta como panorama, e mês, ano, estado, categoria e situação de entrega são lidos por expressões regulares. A resposta avisa que o escopo não foi verificado. Antes das regras entra o modelo reserva (`FALLBACK_PROVIDER` e `FALLBACK_CHAT_MODEL`, por padrão `google:gemini-3.5-flash-lite`): quando a chamada ao modelo principal falha, a análise da pergunta, a síntese e o rerank por LLM repetem a chamada no reserva, o motivo da falha vai para o log e a resposta avisa que o reserva foi usado. As regras só assumem quando os dois modelos falham ou nenhum tem chave.
 
 2. **Busca híbrida.** Para cada frase, o `ReviewRetriever` pede ao FAISS os 40 documentos mais próximos e ao BM25 os 40 de maior pontuação, os dois com os mesmos filtros. O BM25 encontra termos exatos, como "correios" ou "nota fiscal". A tokenização do BM25 tira acentos e stopwords e corta as palavras em 5 letras, mas mantém o "não". As duas listas são fundidas por Reciprocal Rank Fusion (RRF, k=60), que combina posições e dispensa normalizar os scores.
 
@@ -430,7 +430,7 @@ Os números de respostas, recusas e fundamentação acima vêm da execução ant
 
 **Observações antes de executar:**
 --
-1. Você precisa de Python 3.11 ou superior. 
+1. Você precisa de Python 3.12. O `requirements.txt` fixa o PyTorch 2.5.1, que pode não ter pacote para versões mais novas do Python; com outra versão, o `pip install` costuma falhar ao instalar o `torch`. 
 2. A chave de API da OpenAI ou do Google Gemini, que é usada na análise da pergunta e na síntese; sem ela, a busca funciona com as regras de reserva. 
 > Para criar uma chave da OpenAI acesse: https://platform.openai.com/home faça login com sua conta e crie sua chave API e cole no arquivo .env na variavel OPENAI_API_KEY
 
@@ -442,24 +442,23 @@ Os números de respostas, recusas e fundamentação acima vêm da execução ant
 # 1. faça o clone do repositório
 git clone <url-do-repositorio>
 
-# 2. entre na pasta voc_rag
-cd voc_rag
+# 2. entre na pasta raiz do repositório (a que contém app.py e requirements.txt)
+cd <pasta-do-repositorio>
 
-# 3. Crie a máquina virtual para rodar o projeto
+# 3. Crie o ambiente virtual na pasta raiz
 python -m venv .venv
 
-# 4. Ativação da máquina virtual (Linux/macOS; no Windows veja a tabela abaixo**)
-source .venv/bin/activate       
+# 4. Ative o ambiente virtual (Linux/macOS; no Windows veja a tabela abaixo**)
+source .venv/bin/activate
 
-# 5. Voltar a pasta raiz
-cd ..
-
-# 6. Instale as depêndencias (~ 5 a 10 minutos)
+# 5. Instale as dependências (~ 5 a 10 minutos)
 pip install -r requirements.txt
 
-# 7. Preencha a chave do provedor
-cp .env.example .env             
+# 6. Crie o .env e cole a chave do provedor (OPENAI_API_KEY ou GOOGLE_API_KEY)
+cp .env.example .env
 ```
+
+No `.env`, `LLM_PROVIDER` precisa ser o provedor da chave que você colou: com só a chave do Gemini, use `LLM_PROVIDER=google` e um `CHAT_MODEL` do Gemini. Deixe vazia a chave que não tiver; o valor de exemplo não vale como chave. As variáveis são lidas quando o Streamlit inicia: depois de editar o `.env`, pare e rode `streamlit run app.py` de novo.
 
 **Comando de ativação do ambiente virtual depende do terminal:
 
@@ -519,11 +518,12 @@ python -m voc_rag.cli evaluate --split dev --configs full
 | `LLM_PROVIDER` | `openai` | Provedor do chat (e do rerank com `RERANKER=llm`): `openai` ou `google` |
 | `OPENAI_API_KEY` ou `GOOGLE_API_KEY` | sem padrão | Chave do provedor |
 | `CHAT_MODEL` | `gpt-5.6-luna` | Modelo de análise e geração |
+| `FALLBACK_PROVIDER` e `FALLBACK_CHAT_MODEL` | `google` e `gemini-3.5-flash-lite` | Modelo reserva, usado quando o principal falha ou não tem chave; precisa da chave do provedor reserva. `FALLBACK_PROVIDER=none` desliga |
 | `RERANKER` | `cross_encoder` | `cross_encoder` (local) ou `llm` |
 | `CROSS_ENCODER_MODEL` | `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Cross-encoder do rerank local |
 | `MIN_RERANK_SCORE` | `-1.0` | Logit mínimo do cross-encoder |
 | `RERANK_MODEL` | o `CHAT_MODEL` | Modelo do rerank com `RERANKER=llm`; use um modelo barato do mesmo provedor |
-| `JUDGE_PROVIDER` e `JUDGE_MODEL` | os do chat | Juiz da avaliação; use outro provedor para reduzir o viés |
+| `JUDGE_PROVIDER` e `JUDGE_MODEL` | os do chat | Juiz da avaliação; use outro provedor para reduzir o viés. Com outro provedor, `JUDGE_MODEL` herda o modelo reserva quando o provedor coincide; senão, defina-o |
 | `LLM_TEMPERATURE` | não enviada | Defina só para modelos que aceitam temperatura |
 | `EMBEDDING_PROVIDER` | `local` | Provedor dos embeddings: `local`, `openai` ou `google` |
 | `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | Modelo de embeddings |

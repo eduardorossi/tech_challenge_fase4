@@ -1,12 +1,15 @@
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import pandas as pd
 
-from tests.fakes import TEST_SETTINGS
-from voc_rag.pipeline import VoCPipeline
+from tests.fakes import TEST_SETTINGS, StubChatModel
+from voc_rag.llm import ChatModels, record_fallback
+from voc_rag.pipeline import VoCPipeline, build_pipeline
 from voc_rag.prompts import (
-    ERROR_MESSAGE, GENERATION_UNAVAILABLE_MESSAGE, INSUFFICIENT_MESSAGE, OUT_OF_SCOPE_MESSAGE, RULES_NOTICE,
+    ERROR_MESSAGE, FALLBACK_NOTICE, GENERATION_UNAVAILABLE_MESSAGE, INSUFFICIENT_MESSAGE, OUT_OF_SCOPE_MESSAGE,
+    PRIMARY_REPLACED_NOTICE, RULES_NOTICE,
 )
 from voc_rag.query_analyzer import CategoryMatcher, QueryAnalyzer
 from voc_rag.retriever import Retrieval
@@ -185,6 +188,71 @@ class PipelineTest(unittest.TestCase):
         retriever = FakeRetriever(evidences(3))
         pipeline(analysis(max_score=2), retriever).ask("problemas?", use_filters=False)
         self.assertEqual(retriever.calls[0][1].conditions(), [])
+
+    def test_reserve_model_usage_adds_a_notice(self):
+        selected = pipeline(analysis())
+        selected.generator = ReserveGenerator(ANSWER)
+        result = selected.ask("atrasos?")
+        self.assertEqual(result.status, Status.ANSWERED)
+        self.assertEqual(result.trace["fallback_models"], ["gemini-x"])
+        self.assertIn(FALLBACK_NOTICE.format(models="gemini-x"), result.notices)
+
+    def test_no_notice_when_the_primary_answers(self):
+        result = pipeline(analysis()).ask("atrasos?")
+        self.assertEqual((result.trace["fallback_models"], result.notices), ([], []))
+
+    def test_configuration_notices_come_first(self):
+        fallback = analysis()
+        fallback._source = "rules"
+        selected = pipeline(fallback)
+        selected.notices = ["aviso de configuração"]
+        self.assertEqual(selected.ask("atrasos?").notices, ["aviso de configuração", RULES_NOTICE])
+
+    def test_only_real_errors_count_as_failures(self):
+        no_llm = pipeline(analysis())
+        no_llm.generator.available = False
+        self.assertFalse(no_llm.ask("atrasos?").failed)
+        with self.assertLogs("voc_rag.pipeline", "ERROR"):
+            self.assertTrue(pipeline(analysis(), generator_result=TimeoutError()).ask("atrasos?").failed)
+        self.assertFalse(pipeline(analysis()).ask("atrasos?").failed)
+
+
+class ReserveGenerator(FakeGenerator):
+    # Simula o gerador respondendo pelo modelo reserva.
+    def generate(self, question, found, overview):
+        record_fallback("gemini-x")
+        return super().generate(question, found, overview)
+
+
+class BuildPipelineTest(unittest.TestCase):
+    # Monta o pipeline real com dublês só do que lê disco ou chama API: pega erros de ligação entre as classes.
+    def build(self, models: ChatModels) -> VoCPipeline:
+        with patch("voc_rag.pipeline.create_chat_model_pair", return_value=models) as pair, \
+                patch("voc_rag.pipeline.pd.read_parquet", return_value=ANALYTICS), \
+                patch("voc_rag.pipeline.create_vector_store"), patch("voc_rag.pipeline.check_index"), \
+                patch("voc_rag.pipeline.LexicalIndex"), patch("voc_rag.pipeline.create_reranker"):
+            built = build_pipeline(replace(TEST_SETTINGS, fallback_provider="google", fallback_chat_model="gemini-x"))
+        self.assertEqual(pair.call_args.args[3:], ("gemini-x", "google"))
+        return built
+
+    def test_analyzer_and_generator_receive_both_models(self):
+        primary = StubChatModel(error=TimeoutError("sem cota"))
+        built = self.build(ChatModels(primary, StubChatModel(analysis())))
+        self.assertTrue(built.generator.available)
+        with self.assertLogs("voc_rag.llm", "WARNING"):
+            self.assertEqual(built.analyzer.analyze("atrasos?").source, "llm")
+        self.assertEqual(built.notices, [])
+
+    def test_reserve_in_place_of_the_primary_is_announced(self):
+        built = self.build(ChatModels(StubChatModel(analysis()), None, "google:gemini-x"))
+        primary = f"{TEST_SETTINGS.llm_provider}:{TEST_SETTINGS.chat_model}"
+        self.assertEqual(built.notices, [PRIMARY_REPLACED_NOTICE.format(primary=primary, replacement="google:gemini-x")])
+
+    def test_without_models_uses_rules_and_no_generator(self):
+        with self.assertLogs("voc_rag.pipeline", "WARNING"):
+            built = self.build(ChatModels(None, None))
+        self.assertFalse(built.generator.available)
+        self.assertEqual(built.analyzer.analyze("atrasos?").source, "rules")
 
 
 class StubChain:

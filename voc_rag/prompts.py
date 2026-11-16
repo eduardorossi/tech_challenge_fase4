@@ -121,6 +121,15 @@ GENERATION_UNAVAILABLE_MESSAGE = (
 )
 
 RULES_NOTICE = (
-    "O modelo de linguagem não respondeu ou não está configurado; a pergunta foi interpretada por regras. "
-    "O escopo não foi verificado e os filtros podem estar incompletos."
+    "Nenhum modelo de linguagem conseguiu interpretar a pergunta (falha na chamada ou nenhum modelo configurado); "
+    "ela foi interpretada por regras. O escopo não foi verificado e os filtros podem estar incompletos."
+)
+
+FALLBACK_NOTICE = (
+    "O modelo principal não respondeu em pelo menos uma etapa; o modelo reserva ({models}) foi usado. "
+    "O motivo da falha fica registrado no log do servidor."
+)
+
+PRIMARY_REPLACED_NOTICE = (
+    "O modelo principal ({primary}) não tem chave de API configurada; as respostas usam o modelo reserva ({replacement})."
 )

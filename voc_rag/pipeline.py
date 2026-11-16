@@ -10,11 +10,11 @@ from voc_rag.config import Settings
 from voc_rag.generator import AnswerGenerator
 from voc_rag.indexing import check_index, create_vector_store
 from voc_rag.lexical import LexicalIndex
-from voc_rag.llm import create_chat_model_pair
 from voc_rag.labels import describe_conditions
+from voc_rag.llm import create_chat_model_pair, track_fallbacks
 from voc_rag.prompts import (
-    EMPTY_FILTER_MESSAGE, ERROR_MESSAGE, FILTER_FIELD_LABELS, GENERATION_UNAVAILABLE_MESSAGE, INSUFFICIENT_MESSAGE,
-    OUT_OF_SCOPE_MESSAGE, OVERRIDE_NOTICE, RULES_NOTICE,
+    EMPTY_FILTER_MESSAGE, ERROR_MESSAGE, FALLBACK_NOTICE, FILTER_FIELD_LABELS, GENERATION_UNAVAILABLE_MESSAGE,
+    INSUFFICIENT_MESSAGE, OUT_OF_SCOPE_MESSAGE, OVERRIDE_NOTICE, PRIMARY_REPLACED_NOTICE, RULES_NOTICE,
 )
 from voc_rag.query_analyzer import QueryAnalyzer
 from voc_rag.reranker import create_reranker
@@ -44,12 +44,14 @@ class VoCPipeline:
         generator: AnswerGenerator,
         stats: ReviewStats,
         settings: Settings,
+        notices: list[str] | None = None,
     ):
         self.analyzer = analyzer
         self.retriever = retriever
         self.generator = generator
         self.stats = stats
         self.settings = settings
+        self.notices = list(notices or [])
 
     def ask(
         self,
@@ -59,10 +61,16 @@ class VoCPipeline:
         on_progress: ProgressCallback | None = None,
     ) -> PipelineResult:
         started = time.perf_counter()
-        with get_usage_metadata_callback() as usage:
+        with get_usage_metadata_callback() as usage, track_fallbacks() as fallbacks:
             result = self._ask(question, manual_filters, use_filters, on_progress or (lambda stage, data: None))
         result.trace["tokens"] = {model: dict(tokens) for model, tokens in usage.usage_metadata.items()}
         result.trace.setdefault("timings_s", {})["total"] = round(time.perf_counter() - started, 2)
+        used = list(dict.fromkeys(fallbacks))
+        result.trace["fallback_models"] = used
+        notices = [*self.notices, *result.notices]
+        if used:
+            notices.append(FALLBACK_NOTICE.format(models=", ".join(used)))
+        result.notices = notices
         return result
 
     def _ask(
@@ -158,20 +166,27 @@ class VoCPipeline:
 
 def build_pipeline(settings: Settings | None = None) -> VoCPipeline:
     settings = settings or Settings()
-    llm, fallback_llm = create_chat_model_pair(
-        settings.llm_provider, settings.chat_model, settings.temperature, settings.fallback_chat_model
+    models = create_chat_model_pair(
+        settings.llm_provider, settings.chat_model, settings.temperature,
+        settings.fallback_chat_model, settings.fallback_provider,
     )
-    if llm is None:
+    notices = []
+    if models.llm is None:
         logger.warning("Nenhum modelo de chat disponível; a análise usará regras e a síntese ficará indisponível.")
+    elif models.replaced_primary:
+        notices.append(PRIMARY_REPLACED_NOTICE.format(
+            primary=f"{settings.llm_provider}:{settings.chat_model}", replacement=models.replaced_primary
+        ))
     stats = ReviewStats(pd.read_parquet(settings.analytics_path))
     store = create_vector_store(settings)
     check_index(store, settings)
     lexical = LexicalIndex(pd.read_parquet(settings.documents_path)) if settings.use_bm25 else None
     reranker = create_reranker(settings) if settings.use_rerank else None
     return VoCPipeline(
-        analyzer=QueryAnalyzer(llm, stats.categories, fallback_llm),
+        analyzer=QueryAnalyzer(models.llm, stats.categories, models.fallback_llm),
         retriever=ReviewRetriever(store, settings, lexical, reranker),
-        generator=AnswerGenerator(llm, fallback_llm),
+        generator=AnswerGenerator(models.llm, models.fallback_llm),
         stats=stats,
         settings=settings,
+        notices=notices,
     )

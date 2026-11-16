@@ -1,9 +1,29 @@
 import numpy as np
+from langchain_core.runnables import RunnableLambda
 
 from voc_rag.config import Settings
 from voc_rag.schemas import ReviewFilters
 
 TEST_SETTINGS = Settings(min_similarity=0.5, fetch_k=10, lexical_k=10, rerank_k=10, top_k=4, overview_top_k=6)
+
+
+class StubChatModel:
+    """Imita um BaseChatModel em with_structured_output: devolve output ou levanta error."""
+
+    def __init__(self, output=None, error: Exception | None = None, model: str = "stub"):
+        self.output = output
+        self.error = error
+        self.model_name = model
+        self.calls = 0
+
+    def with_structured_output(self, schema):
+        def run(_input):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return self.output(_input) if callable(self.output) else self.output
+
+        return RunnableLambda(run)
 
 
 class FakeEmbeddings:
