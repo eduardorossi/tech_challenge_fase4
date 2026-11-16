@@ -3,6 +3,7 @@ import math
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from voc_rag.llm import create_chat_model_pair, structured_output_with_fallback
 from voc_rag.prompts import RERANK_HUMAN, RERANK_SYSTEM
 
 
@@ -51,9 +52,9 @@ class CrossEncoderReranker:
 class LLMReranker:
     name = "llm"
 
-    def __init__(self, llm, min_score: int = 2, model: str = ""):
+    def __init__(self, llm, min_score: int = 2, model: str = "", fallback_llm=None):
         prompt = ChatPromptTemplate.from_messages([("system", RERANK_SYSTEM), ("human", RERANK_HUMAN)])
-        self.chain = prompt | llm.with_structured_output(RelevanceGrades)
+        self.chain = prompt | structured_output_with_fallback(llm, RelevanceGrades, fallback_llm)
         self.min_score = min_score
         self.model = model
 
@@ -81,7 +82,13 @@ class LLMReranker:
 def create_reranker(settings):
     if settings.reranker == "cross_encoder":
         return CrossEncoderReranker(settings.cross_encoder_model, settings.min_rerank_score)
-    from voc_rag.llm import create_chat_model
-
-    llm = create_chat_model(settings.llm_provider, settings.rerank_model, settings.temperature)
-    return LLMReranker(llm, settings.min_relevance, f"{settings.llm_provider}:{settings.rerank_model}")
+    models = create_chat_model_pair(
+        settings.llm_provider, settings.rerank_model, settings.temperature,
+        settings.fallback_chat_model, settings.fallback_provider,
+    )
+    if models.llm is None:
+        raise RuntimeError(
+            "RERANKER=llm precisa de um modelo de chat. Defina a chave do provedor no .env ou use RERANKER=cross_encoder."
+        )
+    label = models.replaced_primary or f"{settings.llm_provider}:{settings.rerank_model}"
+    return LLMReranker(models.llm, settings.min_relevance, label, models.fallback_llm)
